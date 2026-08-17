@@ -51,6 +51,7 @@ static const char *stat_names[STAT_MAX] = {
 	[STAT_DROPPED] = "DROP (toplam)",
 	[STAT_DROP_IP] = "  - IP kurali",
 	[STAT_DROP_PORT] = "  - port kurali",
+	[STAT_DROP_WL] = "  - izinli degil",
 };
 
 /* Pinlenmis bir map'i ac */
@@ -104,6 +105,7 @@ static int cmd_load(const char *ifname)
 	bpf_map__set_pin_path(skel->maps.blocked_ports, PIN_DIR "/blocked_ports");
 	bpf_map__set_pin_path(skel->maps.events, PIN_DIR "/events");
 	bpf_map__set_pin_path(skel->maps.talkers, PIN_DIR "/talkers");
+	bpf_map__set_pin_path(skel->maps.fw_config, PIN_DIR "/fw_config");
 
 	err = xdpfw_bpf__load(skel);
 	if (err) {
@@ -314,6 +316,16 @@ static const char *proto_adi(__u8 p)
 	}
 }
 
+static const char *sebep_adi(__u8 r)
+{
+	switch (r) {
+	case REASON_IP:          return "ip";
+	case REASON_PORT:        return "port";
+	case REASON_NOT_ALLOWED: return "izinli degil";
+	default:                 return "?";
+	}
+}
+
 /* Ring buffer'dan gelen her olay icin cagrilir */
 static int olay_isle(void *ctx, void *data, size_t len)
 {
@@ -329,13 +341,13 @@ static int olay_isle(void *ctx, void *data, size_t len)
 	sn = (double)e->ts / 1e9;   /* ns -> saniye (boot'tan beri) */
 
 	if (e->dport)
-		printf("[%12.3f] DROP %-15s -> %s/%-5u  (%s kurali)\n",
+		printf("[%12.3f] DROP %-15s -> %s/%-5u  (%s)\n",
 		       sn, ip, proto_adi(e->proto), ntohs(e->dport),
-		       e->reason == REASON_IP ? "ip" : "port");
+		       sebep_adi(e->reason));
 	else
-		printf("[%12.3f] DROP %-15s     %-9s  (%s kurali)\n",
+		printf("[%12.3f] DROP %-15s     %-9s  (%s)\n",
 		       sn, ip, proto_adi(e->proto),
-		       e->reason == REASON_IP ? "ip" : "port");
+		       sebep_adi(e->reason));
 
 	fflush(stdout);
 	return 0;
@@ -375,6 +387,68 @@ static int cmd_log(void)
 }
 
 
+
+
+/* ----------------------------------------------------------------- mode */
+
+static __u32 mod_oku_us(void)
+{
+	__u32 key = CFG_MODE, val = MODE_BLACKLIST;
+	int fd = open_pinned("fw_config");
+
+	if (fd < 0)
+		return MODE_BLACKLIST;
+	bpf_map_lookup_elem(fd, &key, &val);
+	close(fd);
+	return val;
+}
+
+static int cmd_mode(const char *yeni)
+{
+	__u32 key = CFG_MODE, val;
+	int fd;
+
+	fd = open_pinned("fw_config");
+	if (fd < 0)
+		return 1;
+
+	if (!yeni) {
+		/* sadece goster */
+		val = MODE_BLACKLIST;
+		bpf_map_lookup_elem(fd, &key, &val);
+		printf("Aktif mod: %s\n",
+		       val == MODE_WHITELIST ? "whitelist" : "blacklist");
+		close(fd);
+		return 0;
+	}
+
+	if (!strcmp(yeni, "blacklist"))
+		val = MODE_BLACKLIST;
+	else if (!strcmp(yeni, "whitelist"))
+		val = MODE_WHITELIST;
+	else {
+		fprintf(stderr, "Mod 'blacklist' veya 'whitelist' olmali.\n");
+		close(fd);
+		return 1;
+	}
+
+	if (bpf_map_update_elem(fd, &key, &val, BPF_ANY)) {
+		fprintf(stderr, "Mod degistirilemedi: %s\n", strerror(errno));
+		close(fd);
+		return 1;
+	}
+
+	printf("Mod: %s\n", yeni);
+	if (val == MODE_WHITELIST) {
+		printf("\nDIKKAT: Whitelist modunda izinli listede OLMAYAN tum\n");
+		printf("IPv4 trafigi dusurulur. ARP her zaman gecer (yoksa ag\n");
+		printf("tamamen kilitlenirdi). Port kurallari bu modda devre disidir.\n");
+		printf("Izin vermek icin: sudo ./xdpfw allow-ip <ipv4[/prefix]>\n");
+	}
+
+	close(fd);
+	return 0;
+}
 
 /* --------------------------------------------------------------- reload */
 
@@ -576,7 +650,12 @@ static int cmd_list(void)
 	if (fd < 0)
 		return 1;
 
-	printf("Engellenen IP'ler:\n");
+	{
+		__u32 m = mod_oku_us();
+
+		printf("Mod: %s\n\n", m == MODE_WHITELIST ? "whitelist" : "blacklist");
+		printf("%s:\n", m == MODE_WHITELIST ? "Izinli IP'ler" : "Engellenen IP'ler");
+	}
 	{
 		struct lpm_key key, next_key, *pk = NULL;
 		char gosterim[32];
@@ -636,7 +715,9 @@ static void usage(const char *prog)
 "  load <arayuz>              XDP programini bagla\n"
 "  unload <arayuz>            Programi kaldir\n"
 "  stats [saniye]             Canli istatistik (varsayilan 1 sn)\n"
+"  mode [blacklist|whitelist] Modu goster veya degistir\n"
 "  block-ip <ipv4[/prefix]>   Kaynak IP veya CIDR blogu engelle\n"
+"  allow-ip <ipv4[/prefix]>   Whitelist modunda izin ver (block-ip ile ayni map)\n"
 "  unblock-ip <ipv4[/prefix]> IP/CIDR engelini kaldir\n"
 "  block-port <tcp|udp> <p>   Hedef portu engelle\n"
 "  unblock-port <tcp|udp> <p> Port engelini kaldir\n"
@@ -667,6 +748,10 @@ int main(int argc, char **argv)
 		return cmd_unload(argv[2]);
 	if (!strcmp(argv[1], "stats"))
 		return cmd_stats(argc > 2 ? atoi(argv[2]) : 1);
+	if (!strcmp(argv[1], "mode"))
+		return cmd_mode(argc > 2 ? argv[2] : NULL);
+	if (!strcmp(argv[1], "allow-ip") && argc == 3)
+		return cmd_ip(argv[2], 1);
 	if (!strcmp(argv[1], "block-ip") && argc == 3)
 		return cmd_ip(argv[2], 1);
 	if (!strcmp(argv[1], "unblock-ip") && argc == 3)

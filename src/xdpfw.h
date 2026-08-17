@@ -16,13 +16,28 @@ enum stat_idx {
 	STAT_DROPPED,
 	STAT_DROP_IP,     /* IP kurali dusurdu */
 	STAT_DROP_PORT,   /* port kurali dusurdu */
+	STAT_DROP_WL,     /* whitelist: izinli degil */
 	STAT_MAX,
+};
+
+
+/* Calisma modu (config map'inde tutulur) */
+enum fw_mode {
+	MODE_BLACKLIST = 0,   /* varsayilan: listedekiler dusurulur */
+	MODE_WHITELIST = 1,   /* listede OLMAYANLAR dusurulur */
+};
+
+/* config map indeksleri */
+enum cfg_idx {
+	CFG_MODE = 0,
+	CFG_MAX,
 };
 
 /* Drop sebepleri - ring buffer olayinda da kullaniliyor */
 enum drop_reason {
 	REASON_IP = 0,
 	REASON_PORT,
+	REASON_NOT_ALLOWED,   /* whitelist: izinli listede yok */
 };
 
 

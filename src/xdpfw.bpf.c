@@ -35,6 +35,17 @@ struct {
 } blocked_ports SEC(".maps");
 
 /*
+ * Calisma modu ve diger ayarlar.
+ * ARRAY secildi (rodata degil) cunku calisirken degistirilebilmeli.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, CFG_MAX);
+	__type(key, __u32);
+	__type(value, __u32);
+} fw_config SEC(".maps");
+
+/*
  * Top talkers: IP basina paket sayaci.
  *
  * LRU_HASH secimi: map dolunca kernel en uzun suredir dokunulmamis
@@ -104,6 +115,16 @@ static __always_inline void talker_say(__u32 saddr)
 	}
 }
 
+
+/* Aktif modu oku; okunamazsa guvenli varsayilan = blacklist */
+static __always_inline __u32 mod_oku(void)
+{
+	__u32 key = CFG_MODE, *v;
+
+	v = bpf_map_lookup_elem(&fw_config, &key);
+	return v ? *v : MODE_BLACKLIST;
+}
+
 SEC("xdp")
 int xdp_fw(struct xdp_md *ctx)
 {
@@ -117,13 +138,20 @@ int xdp_fw(struct xdp_md *ctx)
 	void *l4;
 	__u32 ihl_bytes, saddr;
 	__u16 dport = 0;
+	__u32 mod;
 
 	bump(STAT_TOTAL);
+	mod = mod_oku();
 
 	if ((void *)(eth + 1) > data_end)
 		return XDP_PASS;
 
 	if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+		/*
+		 * ARP ve digerleri whitelist modunda da GECER.
+		 * ARP dusurulurse adres cozumlemesi calismaz ve ag
+		 * tamamen olur - kural kendini kilitler.
+		 */
 		bump(STAT_OTHER);
 		bump(STAT_PASSED);
 		return XDP_PASS;
@@ -151,7 +179,21 @@ int xdp_fw(struct xdp_md *ctx)
 	__builtin_memcpy(lk.data, &saddr, 4);
 
 	rs = bpf_map_lookup_elem(&blocked_ips, &lk);
-	if (rs) {
+
+	if (mod == MODE_WHITELIST) {
+		/*
+		 * Whitelist: liste IZIN listesi. Eslesme YOKSA dusur.
+		 * Eslesme varsa hits artir ve gecir.
+		 */
+		if (!rs) {
+			bump(STAT_DROPPED);
+			bump(STAT_DROP_WL);
+			olay_gonder(saddr, 0, ip->protocol, REASON_NOT_ALLOWED);
+			return XDP_DROP;
+		}
+		__sync_fetch_and_add(&rs->hits, 1);
+	} else if (rs) {
+		/* Blacklist: eslesme varsa dusur */
 		__sync_fetch_and_add(&rs->hits, 1);
 		bump(STAT_DROPPED);
 		bump(STAT_DROP_IP);
@@ -188,7 +230,7 @@ int xdp_fw(struct xdp_md *ctx)
 	}
 
 	/* --- KURAL 2: hedef port blacklist --- */
-	if (dport) {
+	if (dport && mod == MODE_BLACKLIST) {
 		__builtin_memset(&pk, 0, sizeof(pk));
 		pk.port  = dport;
 		pk.proto = ip->protocol;

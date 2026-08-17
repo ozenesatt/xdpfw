@@ -13,6 +13,7 @@ yapısı oluşturulmadan, sürücü seviyesinde değerlendirilir.
 - En çok paket gönderen kaynaklar (top talkers)
 - Dosya tabanlı kural tanımı ve çalışma anında yeniden yükleme
 - Kural bazlı eşleşme sayaçları ve drop sebebi ayrımı
+- Whitelist modu (varsayılan DROP, yalnızca izinliler geçer)
 
 ## Gereksinimler
 
@@ -53,6 +54,10 @@ sudo ./xdpfw block-ip 10.0.0.0/8     # CIDR bloğu engelle
 sudo ./xdpfw block-port tcp 8080     # port engelle
 sudo ./xdpfw list                    # kuralları ve eşleşmeleri göster
 
+sudo ./xdpfw mode                    # aktif modu göster
+sudo ./xdpfw mode whitelist          # whitelist moduna geç
+sudo ./xdpfw allow-ip 10.0.0.0/8     # whitelist modunda izin ver
+
 sudo ./xdpfw stats                   # canlı sayaç tablosu
 sudo ./xdpfw log                     # canlı drop olay akışı
 sudo ./xdpfw top 10                  # en çok paket gönderen kaynaklar
@@ -87,6 +92,26 @@ beslemesi eklemek BPF programında değişiklik gerektirmez:
 curl -s <feed-url> | grep -E '^[0-9]' | sed 's/^/block ip /' > feed.conf
 sudo ./xdpfw reload feed.conf
 ```
+
+
+## Çalışma modları
+
+| Mod | `blocked_ips` anlamı | Eşleşme var | Eşleşme yok |
+|---|---|---|---|
+| `blacklist` (varsayılan) | yasak listesi | DROP | geçer |
+| `whitelist` | izin listesi | geçer | DROP |
+
+Aynı map iki modda farklı anlam taşır; ikisi aynı anda kullanılmadığı için
+ayrı bir izin listesi tutulmaz. Port kuralları yalnızca blacklist modunda
+işletilir.
+
+ARP ve IPv4 dışı trafik whitelist modunda da geçer. Aksi hâlde adres
+çözümlemesi çalışmaz ve izin verilmiş kaynaklar dahil hiçbir makine
+haberleşemez — kural kendini kilitler.
+
+Whitelist yaklaşımı bilinmeyen tehdide karşı da koruma sağlar (listede
+olmayan her şey düşer), ancak tüm meşru trafiğin önceden tanımlanmasını
+gerektirir. Endüstriyel kontrol sistemleri ve kritik ağlarda tercih edilir.
 
 ## Mimari
 
@@ -170,6 +195,5 @@ sudo bpftool map dump name stats         # map'in ham içeriği
 - IPv6 desteği
 - IP başına hız sınırlama (token bucket)
 - SYN flood tespiti
-- Whitelist modu (varsayılan DROP)
 - Web tabanlı izleme paneli
 - `libxdp` ile çoklu program desteği
