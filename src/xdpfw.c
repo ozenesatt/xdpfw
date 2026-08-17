@@ -48,7 +48,9 @@ static const char *stat_names[STAT_MAX] = {
 	[STAT_ICMP]    = "ICMP",
 	[STAT_OTHER]   = "Diger",
 	[STAT_PASSED]  = "PASS (gecen)",
-	[STAT_DROPPED] = "DROP (engellenen)",
+	[STAT_DROPPED] = "DROP (toplam)",
+	[STAT_DROP_IP] = "  - IP kurali",
+	[STAT_DROP_PORT] = "  - port kurali",
 };
 
 /* Pinlenmis bir map'i ac */
@@ -100,6 +102,7 @@ static int cmd_load(const char *ifname)
 	bpf_map__set_pin_path(skel->maps.stats, PIN_DIR "/stats");
 	bpf_map__set_pin_path(skel->maps.blocked_ips, PIN_DIR "/blocked_ips");
 	bpf_map__set_pin_path(skel->maps.blocked_ports, PIN_DIR "/blocked_ports");
+	bpf_map__set_pin_path(skel->maps.events, PIN_DIR "/events");
 
 	err = xdpfw_bpf__load(skel);
 	if (err) {
@@ -280,6 +283,79 @@ static int cmd_port(const char *proto_s, const char *port_s, int ekle)
 	return err ? 1 : 0;
 }
 
+
+/* ------------------------------------------------------------------ log */
+
+static const char *proto_adi(__u8 p)
+{
+	switch (p) {
+	case IPPROTO_TCP:  return "tcp";
+	case IPPROTO_UDP:  return "udp";
+	case IPPROTO_ICMP: return "icmp";
+	default:           return "?";
+	}
+}
+
+/* Ring buffer'dan gelen her olay icin cagrilir */
+static int olay_isle(void *ctx, void *data, size_t len)
+{
+	const struct drop_event *e = data;
+	char ip[INET_ADDRSTRLEN];
+	double sn;
+
+	(void)ctx;
+	if (len < sizeof(*e))
+		return 0;
+
+	inet_ntop(AF_INET, &e->saddr, ip, sizeof(ip));
+	sn = (double)e->ts / 1e9;   /* ns -> saniye (boot'tan beri) */
+
+	if (e->dport)
+		printf("[%12.3f] DROP %-15s -> %s/%-5u  (%s kurali)\n",
+		       sn, ip, proto_adi(e->proto), ntohs(e->dport),
+		       e->reason == REASON_IP ? "ip" : "port");
+	else
+		printf("[%12.3f] DROP %-15s     %-9s  (%s kurali)\n",
+		       sn, ip, proto_adi(e->proto),
+		       e->reason == REASON_IP ? "ip" : "port");
+
+	fflush(stdout);
+	return 0;
+}
+
+static int cmd_log(void)
+{
+	struct ring_buffer *rb;
+	int fd;
+
+	fd = open_pinned("events");
+	if (fd < 0)
+		return 1;
+
+	rb = ring_buffer__new(fd, olay_isle, NULL, NULL);
+	if (!rb) {
+		fprintf(stderr, "Ring buffer acilamadi\n");
+		close(fd);
+		return 1;
+	}
+
+	printf("Drop olaylari dinleniyor (Ctrl+C ile cik)...\n\n");
+	signal(SIGINT, on_signal);
+
+	while (!stop) {
+		int n = ring_buffer__poll(rb, 200 /* ms */);
+
+		if (n < 0 && n != -EINTR) {
+			fprintf(stderr, "poll hatasi: %d\n", n);
+			break;
+		}
+	}
+
+	ring_buffer__free(rb);
+	close(fd);
+	return 0;
+}
+
 static int cmd_list(void)
 {
 	char buf[INET_ADDRSTRLEN];
@@ -351,6 +427,7 @@ static void usage(const char *prog)
 "  unblock-ip <ipv4>          IP engelini kaldir\n"
 "  block-port <tcp|udp> <p>   Hedef portu engelle\n"
 "  unblock-port <tcp|udp> <p> Port engelini kaldir\n"
+"  log                        Canli drop olay akisi\n"
 "  list                       Kurallari listele\n"
 "\n"
 "Ornek:\n"
@@ -383,6 +460,8 @@ int main(int argc, char **argv)
 		return cmd_port(argv[2], argv[3], 1);
 	if (!strcmp(argv[1], "unblock-port") && argc == 4)
 		return cmd_port(argv[2], argv[3], 0);
+	if (!strcmp(argv[1], "log"))
+		return cmd_log();
 	if (!strcmp(argv[1], "list"))
 		return cmd_list();
 

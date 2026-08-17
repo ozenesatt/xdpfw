@@ -22,7 +22,6 @@ struct {
 	__type(value, struct rule_stat);
 } blocked_ips SEC(".maps");
 
-/* Port blacklist: key = {port, proto} cifti */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
@@ -30,12 +29,42 @@ struct {
 	__type(value, struct rule_stat);
 } blocked_ports SEC(".maps");
 
+/*
+ * Ring buffer: kernel -> userspace olay akisi.
+ * max_entries = tampon boyutu (bayt), 2'nin kuvveti ve sayfa boyutunun
+ * kati olmali. 256 KB yaklasik 6500 olay tutar.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} events SEC(".maps");
+
 static __always_inline void bump(__u32 idx)
 {
 	__u64 *val = bpf_map_lookup_elem(&stats, &idx);
 
 	if (val)
 		*val += 1;
+}
+
+/* Drop olayini ring buffer'a yaz */
+static __always_inline void olay_gonder(__u32 saddr, __u16 dport,
+					__u8 proto, __u8 reason)
+{
+	struct drop_event *e;
+
+	/* reserve NULL donebilir (tampon dolu) - verifier kontrol istiyor */
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return;
+
+	e->ts     = bpf_ktime_get_ns();
+	e->saddr  = saddr;
+	e->dport  = dport;
+	e->proto  = proto;
+	e->reason = reason;
+
+	bpf_ringbuf_submit(e, 0);
 }
 
 SEC("xdp")
@@ -80,10 +109,12 @@ int xdp_fw(struct xdp_md *ctx)
 	if (rs) {
 		__sync_fetch_and_add(&rs->hits, 1);
 		bump(STAT_DROPPED);
+		bump(STAT_DROP_IP);
+		olay_gonder(saddr, 0, ip->protocol, REASON_IP);
 		return XDP_DROP;
 	}
 
-	/* --- Protokol sayaci + hedef port cikarimi --- */
+	/* --- Protokol sayaci + hedef port --- */
 	switch (ip->protocol) {
 	case IPPROTO_TCP: {
 		struct tcphdr *tcp = l4;
@@ -113,15 +144,16 @@ int xdp_fw(struct xdp_md *ctx)
 
 	/* --- KURAL 2: hedef port blacklist --- */
 	if (dport) {
-		/* Padding baytini sifirla, yoksa lookup tutmaz */
 		__builtin_memset(&pk, 0, sizeof(pk));
-		pk.port  = dport;   /* cevrilmiyor, network order */
+		pk.port  = dport;
 		pk.proto = ip->protocol;
 
 		rs = bpf_map_lookup_elem(&blocked_ports, &pk);
 		if (rs) {
 			__sync_fetch_and_add(&rs->hits, 1);
 			bump(STAT_DROPPED);
+			bump(STAT_DROP_PORT);
+			olay_gonder(saddr, dport, ip->protocol, REASON_PORT);
 			return XDP_DROP;
 		}
 	}
