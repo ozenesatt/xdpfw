@@ -35,6 +35,23 @@ struct {
 } blocked_ports SEC(".maps");
 
 /*
+ * Top talkers: IP basina paket sayaci.
+ *
+ * LRU_HASH secimi: map dolunca kernel en uzun suredir dokunulmamis
+ * kaydi otomatik atar. Kac farkli IP gelecegi bilinmedigi icin normal
+ * HASH ile tasma yonetimi gerekirdi; LRU bunu kernel'e devrediyor.
+ *
+ * Bedeli: kesinlik. Dusen bir IP'nin sayaci sifirlanir.
+ * Izleme icin kabul edilebilir, muhasebe icin degil.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u32);       /* kaynak IP, network byte order */
+	__type(value, __u64);     /* paket sayisi */
+} talkers SEC(".maps");
+
+/*
  * Ring buffer: kernel -> userspace olay akisi.
  * max_entries = tampon boyutu (bayt), 2'nin kuvveti ve sayfa boyutunun
  * kati olmali. 256 KB yaklasik 6500 olay tutar.
@@ -70,6 +87,21 @@ static __always_inline void olay_gonder(__u32 saddr, __u16 dport,
 	e->reason = reason;
 
 	bpf_ringbuf_submit(e, 0);
+}
+
+
+/* Kaynak IP'nin paket sayacini artir */
+static __always_inline void talker_say(__u32 saddr)
+{
+	__u64 *n, bir = 1;
+
+	n = bpf_map_lookup_elem(&talkers, &saddr);
+	if (n) {
+		/* LRU_HASH paylasimli -> atomik artis */
+		__sync_fetch_and_add(n, 1);
+	} else {
+		bpf_map_update_elem(&talkers, &saddr, &bir, BPF_ANY);
+	}
 }
 
 SEC("xdp")
@@ -111,6 +143,7 @@ int xdp_fw(struct xdp_md *ctx)
 
 	/* --- KURAL 1: kaynak IP blacklist --- */
 	saddr = ip->saddr;
+	talker_say(saddr);
 
 	/* LPM lookup: prefixlen her zaman 32, kernel en uzun oneki bulur */
 	__builtin_memset(&lk, 0, sizeof(lk));

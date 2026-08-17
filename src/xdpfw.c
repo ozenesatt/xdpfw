@@ -103,6 +103,7 @@ static int cmd_load(const char *ifname)
 	bpf_map__set_pin_path(skel->maps.blocked_ips, PIN_DIR "/blocked_ips");
 	bpf_map__set_pin_path(skel->maps.blocked_ports, PIN_DIR "/blocked_ports");
 	bpf_map__set_pin_path(skel->maps.events, PIN_DIR "/events");
+	bpf_map__set_pin_path(skel->maps.talkers, PIN_DIR "/talkers");
 
 	err = xdpfw_bpf__load(skel);
 	if (err) {
@@ -373,6 +374,87 @@ static int cmd_log(void)
 	return 0;
 }
 
+
+/* ------------------------------------------------------------------ top */
+
+struct talker {
+	__u32 ip;
+	__u64 paket;
+};
+
+/* qsort icin: cok paketten aza sirala */
+static int talker_cmp(const void *a, const void *b)
+{
+	const struct talker *x = a, *y = b;
+
+	if (x->paket < y->paket)
+		return 1;
+	if (x->paket > y->paket)
+		return -1;
+	return 0;
+}
+
+static int cmd_top(int adet)
+{
+	struct talker *liste = NULL;
+	__u32 key, next_key, *pk = NULL;
+	char buf[INET_ADDRSTRLEN];
+	__u64 deger, toplam = 0;
+	int fd, n = 0, kapasite = 256, i;
+
+	fd = open_pinned("talkers");
+	if (fd < 0)
+		return 1;
+
+	liste = malloc(kapasite * sizeof(*liste));
+	if (!liste) {
+		close(fd);
+		return 1;
+	}
+
+	/* Tum map'i tara */
+	while (bpf_map_get_next_key(fd, pk, &next_key) == 0) {
+		key = next_key;
+		if (bpf_map_lookup_elem(fd, &key, &deger) == 0) {
+			if (n == kapasite) {
+				struct talker *yeni;
+
+				kapasite *= 2;
+				yeni = realloc(liste, kapasite * sizeof(*liste));
+				if (!yeni)
+					break;
+				liste = yeni;
+			}
+			liste[n].ip = key;
+			liste[n].paket = deger;
+			toplam += deger;
+			n++;
+		}
+		pk = &key;
+	}
+
+	qsort(liste, n, sizeof(*liste), talker_cmp);
+
+	printf("En cok paket gonderen kaynaklar (toplam %d adres, %llu paket)\n\n",
+	       n, (unsigned long long)toplam);
+	printf("%-4s %-16s %14s %8s\n", "#", "KAYNAK IP", "PAKET", "ORAN");
+	printf("--------------------------------------------------\n");
+
+	for (i = 0; i < n && i < adet; i++) {
+		double oran = toplam ? 100.0 * liste[i].paket / toplam : 0.0;
+
+		inet_ntop(AF_INET, &liste[i].ip, buf, sizeof(buf));
+		printf("%-4d %-16s %14llu %7.1f%%\n", i + 1, buf,
+		       (unsigned long long)liste[i].paket, oran);
+	}
+	if (n == 0)
+		printf("(kayit yok)\n");
+
+	free(liste);
+	close(fd);
+	return 0;
+}
+
 static int cmd_list(void)
 {
 	char buf[INET_ADDRSTRLEN];
@@ -448,6 +530,7 @@ static void usage(const char *prog)
 "  block-port <tcp|udp> <p>   Hedef portu engelle\n"
 "  unblock-port <tcp|udp> <p> Port engelini kaldir\n"
 "  log                        Canli drop olay akisi\n"
+"  top [n]                    En cok paket gonderen IP'ler (varsayilan 10)\n"
 "  list                       Kurallari listele\n"
 "\n"
 "Ornek:\n"
@@ -480,6 +563,8 @@ int main(int argc, char **argv)
 		return cmd_port(argv[2], argv[3], 1);
 	if (!strcmp(argv[1], "unblock-port") && argc == 4)
 		return cmd_port(argv[2], argv[3], 0);
+	if (!strcmp(argv[1], "top"))
+		return cmd_top(argc > 2 ? atoi(argv[2]) : 10);
 	if (!strcmp(argv[1], "log"))
 		return cmd_log();
 	if (!strcmp(argv[1], "list"))
