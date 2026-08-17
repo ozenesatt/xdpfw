@@ -22,4 +22,19 @@ struct rule_stat {
 	__u64 hits;
 };
 
+/*
+ * Port blacklist anahtari.
+ *
+ * DIKKAT: BPF hash map anahtarlari BAYT BAYT karsilastirilir.
+ * Derleyici struct'i 4 bayta hizalar; 4. bayt tanimsiz kalirsa
+ * icindeki cop yuzunden lookup asla tutmaz.
+ * Bu yuzden pad alani ACIKCA tanimli ve her kullanimdan once
+ * struct memset ile sifirlaniyor.
+ */
+struct port_key {
+	__u16 port;   /* network byte order */
+	__u8  proto;  /* IPPROTO_TCP = 6, IPPROTO_UDP = 17 */
+	__u8  pad;    /* her zaman 0 */
+};
+
 #endif /* __XDPFW_H */

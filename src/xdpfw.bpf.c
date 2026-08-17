@@ -15,18 +15,20 @@ struct {
 	__type(value, __u64);
 } stats SEC(".maps");
 
-/*
- * IP blacklist.
- * key   = kaynak IPv4 adresi (network byte order, cevrilmeden)
- * value = bu kural kac pakette eslesti
- * HASH paylasimli: CPU basina kopya yok, artis atomik olmali.
- */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
 	__type(key, __u32);
 	__type(value, struct rule_stat);
 } blocked_ips SEC(".maps");
+
+/* Port blacklist: key = {port, proto} cifti */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct port_key);
+	__type(value, struct rule_stat);
+} blocked_ports SEC(".maps");
 
 static __always_inline void bump(__u32 idx)
 {
@@ -44,7 +46,10 @@ int xdp_fw(struct xdp_md *ctx)
 	struct ethhdr *eth = data;
 	struct iphdr *ip;
 	struct rule_stat *rs;
+	struct port_key pk;
+	void *l4;
 	__u32 ihl_bytes, saddr;
+	__u16 dport = 0;
 
 	bump(STAT_TOTAL);
 
@@ -65,13 +70,11 @@ int xdp_fw(struct xdp_md *ctx)
 		return XDP_PASS;
 	ihl_bytes = ip->ihl * 4;
 
-	if ((void *)ip + ihl_bytes > data_end)
+	l4 = (void *)ip + ihl_bytes;
+	if (l4 > data_end)
 		return XDP_PASS;
 
-	/* --- KURAL: kaynak IP blacklist'te mi? ---
-	 * saddr CEVRILMIYOR. Paketten network byte order geliyor,
-	 * kullanici alani da inet_pton ile ayni sirada yaziyor.
-	 */
+	/* --- KURAL 1: kaynak IP blacklist --- */
 	saddr = ip->saddr;
 	rs = bpf_map_lookup_elem(&blocked_ips, &saddr);
 	if (rs) {
@@ -80,19 +83,47 @@ int xdp_fw(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
+	/* --- Protokol sayaci + hedef port cikarimi --- */
 	switch (ip->protocol) {
-	case IPPROTO_TCP:
+	case IPPROTO_TCP: {
+		struct tcphdr *tcp = l4;
+
+		if ((void *)(tcp + 1) > data_end)
+			return XDP_PASS;
+		dport = tcp->dest;
 		bump(STAT_TCP);
 		break;
-	case IPPROTO_UDP:
+	}
+	case IPPROTO_UDP: {
+		struct udphdr *udp = l4;
+
+		if ((void *)(udp + 1) > data_end)
+			return XDP_PASS;
+		dport = udp->dest;
 		bump(STAT_UDP);
 		break;
+	}
 	case IPPROTO_ICMP:
 		bump(STAT_ICMP);
 		break;
 	default:
 		bump(STAT_OTHER);
 		break;
+	}
+
+	/* --- KURAL 2: hedef port blacklist --- */
+	if (dport) {
+		/* Padding baytini sifirla, yoksa lookup tutmaz */
+		__builtin_memset(&pk, 0, sizeof(pk));
+		pk.port  = dport;   /* cevrilmiyor, network order */
+		pk.proto = ip->protocol;
+
+		rs = bpf_map_lookup_elem(&blocked_ports, &pk);
+		if (rs) {
+			__sync_fetch_and_add(&rs->hits, 1);
+			bump(STAT_DROPPED);
+			return XDP_DROP;
+		}
 	}
 
 	bump(STAT_PASSED);

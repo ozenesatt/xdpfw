@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +40,6 @@ static const char *stat_names[STAT_MAX] = {
 	[STAT_DROPPED] = "DROP (engellenen)",
 };
 
-/* Blacklist'e IP ekle. Donus: 0 basarili */
 static int block_ip(int map_fd, const char *ipstr)
 {
 	struct rule_stat val = {};
@@ -51,38 +51,99 @@ static int block_ip(int map_fd, const char *ipstr)
 		return -1;
 	}
 
-	/* addr.s_addr zaten network byte order. BPF tarafi da
-	 * ip->saddr'i cevirmeden kullaniyor -> uyumlu. */
+	/* addr.s_addr network byte order; BPF de cevirmeden kullaniyor */
 	key = addr.s_addr;
 
 	if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY)) {
 		fprintf(stderr, "Map'e yazilamadi: %s\n", strerror(errno));
 		return -1;
 	}
-	printf("Engellendi: %s\n", ipstr);
+	printf("Engellendi (IP): %s\n", ipstr);
 	return 0;
 }
 
-/* Kural listesini ve eslesme sayilarini bas */
-static void list_rules(int map_fd)
+/* "tcp:9999" veya "udp:53" formatini isler */
+static int block_port(int map_fd, const char *spec)
+{
+	struct rule_stat val = {};
+	struct port_key key;
+	const char *iki_nokta;
+	int port;
+	__u8 proto;
+
+	iki_nokta = strchr(spec, ':');
+	if (!iki_nokta) {
+		fprintf(stderr, "Gecersiz kural: %s (ornek: tcp:8080)\n", spec);
+		return -1;
+	}
+
+	if (!strncmp(spec, "tcp:", 4))
+		proto = IPPROTO_TCP;
+	else if (!strncmp(spec, "udp:", 4))
+		proto = IPPROTO_UDP;
+	else {
+		fprintf(stderr, "Protokol 'tcp' veya 'udp' olmali: %s\n", spec);
+		return -1;
+	}
+
+	port = atoi(iki_nokta + 1);
+	if (port < 1 || port > 65535) {
+		fprintf(stderr, "Gecersiz port: %s\n", spec);
+		return -1;
+	}
+
+	/* KRITIK: padding dahil tum struct sifirlanmali */
+	memset(&key, 0, sizeof(key));
+	key.port  = htons((__u16)port);   /* network byte order */
+	key.proto = proto;
+
+	if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY)) {
+		fprintf(stderr, "Map'e yazilamadi: %s\n", strerror(errno));
+		return -1;
+	}
+	printf("Engellendi (port): %s\n", spec);
+	return 0;
+}
+
+static void list_rules(int ip_fd, int port_fd)
 {
 	char buf[INET_ADDRSTRLEN];
 	struct rule_stat val;
-	__u32 key, next_key;
-	__u32 *pk = NULL;
 	int bos = 1;
 
-	printf("\nEngellenen IP'ler:\n");
-	while (bpf_map_get_next_key(map_fd, pk, &next_key) == 0) {
-		key = next_key;
-		if (bpf_map_lookup_elem(map_fd, &key, &val) == 0) {
-			inet_ntop(AF_INET, &key, buf, sizeof(buf));
-			printf("  %-16s eslesme=%llu\n", buf,
-			       (unsigned long long)val.hits);
-			bos = 0;
+	printf("\nKurallar:\n");
+
+	{
+		__u32 key, next_key, *pk = NULL;
+
+		while (bpf_map_get_next_key(ip_fd, pk, &next_key) == 0) {
+			key = next_key;
+			if (bpf_map_lookup_elem(ip_fd, &key, &val) == 0) {
+				inet_ntop(AF_INET, &key, buf, sizeof(buf));
+				printf("  ip   %-16s eslesme=%llu\n", buf,
+				       (unsigned long long)val.hits);
+				bos = 0;
+			}
+			pk = &key;
 		}
-		pk = &key;
 	}
+
+	{
+		struct port_key key, next_key, *pk = NULL;
+
+		while (bpf_map_get_next_key(port_fd, pk, &next_key) == 0) {
+			key = next_key;
+			if (bpf_map_lookup_elem(port_fd, &key, &val) == 0) {
+				printf("  %-4s %-16u eslesme=%llu\n",
+				       key.proto == IPPROTO_TCP ? "tcp" : "udp",
+				       ntohs(key.port),
+				       (unsigned long long)val.hits);
+				bos = 0;
+			}
+			pk = &key;
+		}
+	}
+
 	if (bos)
 		printf("  (kural yok)\n");
 }
@@ -93,14 +154,18 @@ int main(int argc, char **argv)
 	struct bpf_link *link = NULL;
 	__u64 cur[STAT_MAX], prev[STAT_MAX] = {};
 	__u64 *percpu = NULL;
-	int ifindex, ncpu, stats_fd, bl_fd, err = 0;
+	int ifindex, ncpu, stats_fd, ip_fd, port_fd, err = 0;
 	int first = 1, i;
 	__u32 k;
 
 	if (argc < 2) {
 		fprintf(stderr,
-			"Kullanim: %s <arayuz> [engellenecek-ip ...]\n"
-			"Ornek:   sudo %s veth0 10.10.0.2\n",
+			"Kullanim: %s <arayuz> [kural ...]\n"
+			"Kural formatlari:\n"
+			"  10.10.0.2    kaynak IP engelle\n"
+			"  tcp:9999     hedef TCP portu engelle\n"
+			"  udp:53       hedef UDP portu engelle\n"
+			"\nOrnek: sudo %s veth0 tcp:9999 10.10.0.5\n",
 			argv[0], argv[0]);
 		return 1;
 	}
@@ -124,11 +189,16 @@ int main(int argc, char **argv)
 	}
 
 	stats_fd = bpf_map__fd(skel->maps.stats);
-	bl_fd    = bpf_map__fd(skel->maps.blocked_ips);
+	ip_fd    = bpf_map__fd(skel->maps.blocked_ips);
+	port_fd  = bpf_map__fd(skel->maps.blocked_ports);
 
-	/* Komut satirindaki IP'leri blacklist'e ekle */
-	for (i = 2; i < argc; i++)
-		block_ip(bl_fd, argv[i]);
+	/* Komut satirindaki kurallari isle */
+	for (i = 2; i < argc; i++) {
+		if (strchr(argv[i], ':'))
+			block_port(port_fd, argv[i]);
+		else
+			block_ip(ip_fd, argv[i]);
+	}
 
 	link = bpf_program__attach_xdp(skel->progs.xdp_fw, ifindex);
 	if (!link) {
@@ -166,7 +236,7 @@ int main(int argc, char **argv)
 			       (unsigned long long)cur[k],
 			       (unsigned long long)(first ? 0 : cur[k] - prev[k]));
 
-		list_rules(bl_fd);
+		list_rules(ip_fd, port_fd);
 		fflush(stdout);
 
 		memcpy(prev, cur, sizeof(cur));
