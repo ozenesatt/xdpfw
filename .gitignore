@@ -2,3 +2,4 @@ src/vmlinux.h
 src/*.skel.h
 src/*.o
 xdpfw
+src/panel.h

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<title>xdpfw paneli</title>
+<style>
+:root { --bg:#0f1419; --card:#1a212b; --line:#2a3441; --fg:#d5dae1; --dim:#7c8b9d;
+        --ok:#4ec9a0; --warn:#e0a458; --bad:#e05d5d; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--bg); color:var(--fg); font:14px/1.6 system-ui,sans-serif; padding:24px; }
+h1 { font-size:18px; font-weight:500; margin-bottom:4px; }
+.mod { display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px;
+       background:var(--line); color:var(--dim); }
+.mod.wl { background:#3a2a1a; color:var(--warn); }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:20px 0; }
+.kart { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+.kart .etiket { font-size:12px; color:var(--dim); }
+.kart .deger { font-size:24px; font-weight:500; margin-top:4px; font-variant-numeric:tabular-nums; }
+.kart .pps { font-size:12px; color:var(--dim); }
+.kart.drop .deger { color:var(--bad); }
+.kart.pass .deger { color:var(--ok); }
+.alt { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
+section h2 { font-size:13px; font-weight:500; color:var(--dim); margin-bottom:10px;
+             text-transform:uppercase; letter-spacing:.5px; }
+table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+th { text-align:left; font-weight:400; color:var(--dim); font-size:12px;
+     border-bottom:1px solid var(--line); padding:4px 0; }
+td { padding:5px 0; border-bottom:1px solid rgba(42,52,65,.4); }
+td.n { text-align:right; }
+.bos { color:var(--dim); font-size:13px; padding:8px 0; }
+footer { margin-top:20px; font-size:12px; color:var(--dim); }
+@media(max-width:700px){ .alt{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+
+<h1>xdpfw <span id="mod" class="mod">-</span></h1>
+
+<div class="grid" id="kartlar"></div>
+
+<div class="alt">
+  <section>
+    <h2 id="kural-baslik">Kurallar</h2>
+    <table><thead><tr><th>Kural</th><th class="n">Eşleşme</th></tr></thead>
+    <tbody id="kurallar"></tbody></table>
+  </section>
+  <section>
+    <h2>En çok paket gönderenler</h2>
+    <table><thead><tr><th>Kaynak IP</th><th class="n">Paket</th></tr></thead>
+    <tbody id="talkers"></tbody></table>
+  </section>
+</div>
+
+<footer id="durum">bağlanıyor…</footer>
+
+<script>
+let onceki = null;
+
+function say(n){ return n.toLocaleString('tr-TR'); }
+
+function kart(etiket, deger, pps, sinif){
+  return `<div class="kart ${sinif||''}">
+    <div class="etiket">${etiket}</div>
+    <div class="deger">${say(deger)}</div>
+    <div class="pps">${pps!==null ? say(pps)+' pkt/sn' : '&nbsp;'}</div>
+  </div>`;
+}
+
+async function guncelle(){
+  let d;
+  try {
+    const r = await fetch('/api/stats');
+    d = await r.json();
+  } catch(e) {
+    document.getElementById('durum').textContent = 'bağlantı yok';
+    return;
+  }
+
+  const s = d.stats || {};
+  const wl = d.mode === 'whitelist';
+
+  const m = document.getElementById('mod');
+  m.textContent = d.mode;
+  m.className = 'mod' + (wl ? ' wl' : '');
+
+  const delta = k => onceki ? Math.max(0, (s[k]||0) - (onceki[k]||0)) : null;
+
+  document.getElementById('kartlar').innerHTML =
+      kart('Toplam paket', s.total||0, delta('total')) +
+      kart('Geçen', s.passed||0, delta('passed'), 'pass') +
+      kart('Düşürülen', s.dropped||0, delta('dropped'), 'drop') +
+      kart('TCP', s.tcp||0, delta('tcp')) +
+      kart('UDP', s.udp||0, delta('udp')) +
+      kart('ICMP', s.icmp||0, delta('icmp'));
+
+  document.getElementById('kural-baslik').textContent =
+      wl ? 'İzinli kaynaklar' : 'Engelli kurallar';
+
+  const satirlar = [];
+  (d.ips||[]).forEach(x => satirlar.push(
+      `<tr><td>${x.cidr}</td><td class="n">${say(x.hits)}</td></tr>`));
+  (d.ports||[]).forEach(x => satirlar.push(
+      `<tr><td>${x.proto}/${x.port}</td><td class="n">${say(x.hits)}</td></tr>`));
+  document.getElementById('kurallar').innerHTML =
+      satirlar.length ? satirlar.join('') : '<tr><td colspan="2" class="bos">kural yok</td></tr>';
+
+  const t = (d.talkers||[]).map(x =>
+      `<tr><td>${x.ip}</td><td class="n">${say(x.packets)}</td></tr>`);
+  document.getElementById('talkers').innerHTML =
+      t.length ? t.join('') : '<tr><td colspan="2" class="bos">kayıt yok</td></tr>';
+
+  document.getElementById('durum').textContent =
+      'son güncelleme ' + new Date().toLocaleTimeString('tr-TR');
+
+  onceki = s;
+}
+
+guncelle();
+setInterval(guncelle, 1000);
+</script>
+</body>
+</html>

@@ -23,11 +23,15 @@ $(SRC)/$(APP).bpf.o: $(SRC)/$(APP).bpf.c $(SRC)/vmlinux.h
 $(SRC)/$(APP).skel.h: $(SRC)/$(APP).bpf.o
 	$(BPFTOOL) gen skeleton $< > $@
 
-$(APP): $(SRC)/$(APP).c $(SRC)/$(APP).skel.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+# HTML'i C basligina gom (binary tek basina calissin)
+$(SRC)/panel.h: $(SRC)/panel.html
+	./scripts/gen-panel-header.sh
+
+$(APP): $(SRC)/$(APP).c $(SRC)/serve.c $(SRC)/$(APP).skel.h $(SRC)/panel.h
+	$(CC) $(CFLAGS) $(SRC)/$(APP).c $(SRC)/serve.c -o $@ $(LDLIBS)
 
 clean:
-	rm -f $(APP) $(SRC)/$(APP).bpf.o $(SRC)/$(APP).skel.h
+	rm -f $(APP) $(SRC)/$(APP).bpf.o $(SRC)/$(APP).skel.h $(SRC)/panel.h
 
 distclean: clean
 	rm -f $(SRC)/vmlinux.h

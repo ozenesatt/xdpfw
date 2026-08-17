@@ -28,10 +28,15 @@
 
 static volatile sig_atomic_t stop;
 
+/* serve.c ile paylasilan durdurma bayragi */
+volatile sig_atomic_t serve_stop;
+int serve_calistir(int port);
+
 static void on_signal(int sig)
 {
 	(void)sig;
 	stop = 1;
+	serve_stop = 1;
 }
 
 static int print_fn(enum libbpf_print_level level, const char *fmt, va_list args)
@@ -725,6 +730,7 @@ static void usage(const char *prog)
 "  top [n]                    En cok paket gonderen IP'ler (varsayilan 10)\n"
 "  list                       Kurallari listele\n"
 "  reload <dosya>             Kural dosyasindan yeniden yukle\n"
+"  serve [port]               Web paneli (varsayilan 8080, sadece localhost)\n"
 "\n"
 "Ornek:\n"
 "  sudo %s load veth0\n"
@@ -764,6 +770,11 @@ int main(int argc, char **argv)
 		return cmd_top(argc > 2 ? atoi(argv[2]) : 10);
 	if (!strcmp(argv[1], "log"))
 		return cmd_log();
+	if (!strcmp(argv[1], "serve")) {
+		signal(SIGINT, on_signal);
+		signal(SIGTERM, on_signal);
+		return serve_calistir(argc > 2 ? atoi(argv[2]) : 8080);
+	}
 	if (!strcmp(argv[1], "reload") && argc == 3)
 		return cmd_reload(argv[2]);
 	if (!strcmp(argv[1], "list"))
