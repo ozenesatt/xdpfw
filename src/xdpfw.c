@@ -375,6 +375,117 @@ static int cmd_log(void)
 }
 
 
+
+/* --------------------------------------------------------------- reload */
+
+/* Bir map'teki tum kayitlari sil */
+static int map_temizle(int fd, size_t key_size)
+{
+	unsigned char key[64], next_key[64];
+	void *pk = NULL;
+	int silinen = 0;
+
+	if (key_size > sizeof(key))
+		return -1;
+
+	/*
+	 * Silme sirasinda get_next_key kullanmak zor: sildigin anahtarin
+	 * yerini kaybediyorsun. Bu yuzden her turda bastan basliyoruz.
+	 */
+	while (bpf_map_get_next_key(fd, pk, next_key) == 0) {
+		memcpy(key, next_key, key_size);
+		if (bpf_map_delete_elem(fd, key) == 0)
+			silinen++;
+		pk = NULL;   /* bastan tara */
+	}
+	return silinen;
+}
+
+static int cmd_reload(const char *dosya)
+{
+	FILE *f;
+	char satir[256];
+	int ip_fd, port_fd;
+	int satir_no = 0, eklenen = 0, hatali = 0;
+
+	f = fopen(dosya, "r");
+	if (!f) {
+		fprintf(stderr, "Dosya acilamadi: %s (%s)\n", dosya, strerror(errno));
+		return 1;
+	}
+
+	ip_fd = open_pinned("blocked_ips");
+	if (ip_fd < 0) {
+		fclose(f);
+		return 1;
+	}
+	port_fd = open_pinned("blocked_ports");
+	if (port_fd < 0) {
+		close(ip_fd);
+		fclose(f);
+		return 1;
+	}
+
+	/*
+	 * Once temizle, sonra doldur.
+	 * Boylece dosyadan silinen kural map'te kalmaz - dosya neyi
+	 * soyluyorsa map o hale gelir (declarative).
+	 */
+	printf("Mevcut kurallar temizleniyor: %d IP, %d port\n",
+	       map_temizle(ip_fd, sizeof(struct lpm_key)),
+	       map_temizle(port_fd, sizeof(struct port_key)));
+
+	close(ip_fd);
+	close(port_fd);
+
+	while (fgets(satir, sizeof(satir), f)) {
+		char komut[32] = "", tip[32] = "", a1[64] = "", a2[64] = "";
+		int n;
+
+		satir_no++;
+
+		/* yorum ve bos satirlari atla */
+		{
+			char *p = satir;
+
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (*p == '#' || *p == '\n' || *p == '\0')
+				continue;
+		}
+
+		n = sscanf(satir, "%31s %31s %63s %63s", komut, tip, a1, a2);
+
+		if (n < 3 || strcmp(komut, "block")) {
+			fprintf(stderr, "  satir %d: anlasilmadi -> %s", satir_no, satir);
+			hatali++;
+			continue;
+		}
+
+		if (!strcmp(tip, "ip") && n == 3) {
+			if (cmd_ip(a1, 1) == 0)
+				eklenen++;
+			else
+				hatali++;
+		} else if (!strcmp(tip, "port") && n == 4) {
+			if (cmd_port(a1, a2, 1) == 0)
+				eklenen++;
+			else
+				hatali++;
+		} else {
+			fprintf(stderr, "  satir %d: gecersiz kural -> %s", satir_no, satir);
+			hatali++;
+		}
+	}
+
+	fclose(f);
+	printf("\n%d kural yuklendi", eklenen);
+	if (hatali)
+		printf(", %d satir atlandi", hatali);
+	printf(".\n");
+	return hatali ? 1 : 0;
+}
+
 /* ------------------------------------------------------------------ top */
 
 struct talker {
@@ -532,6 +643,7 @@ static void usage(const char *prog)
 "  log                        Canli drop olay akisi\n"
 "  top [n]                    En cok paket gonderen IP'ler (varsayilan 10)\n"
 "  list                       Kurallari listele\n"
+"  reload <dosya>             Kural dosyasindan yeniden yukle\n"
 "\n"
 "Ornek:\n"
 "  sudo %s load veth0\n"
@@ -567,6 +679,8 @@ int main(int argc, char **argv)
 		return cmd_top(argc > 2 ? atoi(argv[2]) : 10);
 	if (!strcmp(argv[1], "log"))
 		return cmd_log();
+	if (!strcmp(argv[1], "reload") && argc == 3)
+		return cmd_reload(argv[2]);
 	if (!strcmp(argv[1], "list"))
 		return cmd_list();
 
