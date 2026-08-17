@@ -1,4 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
+/*
+ * xdpfw - XDP firewall kullanici alani araci
+ *
+ * Tasarim: "load" komutu programi baglayip map'leri ve link'i bpffs'e
+ * pinler, sonra cikar. Diger komutlar pinlenmis map'leri acarak calisir.
+ * "unload" link pinini siler -> son referans gidince kernel programi
+ * otomatik detach eder.
+ */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <net/if.h>
@@ -7,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <bpf/bpf.h>
@@ -14,6 +23,8 @@
 
 #include "xdpfw.h"
 #include "xdpfw.skel.h"
+
+#define PIN_DIR "/sys/fs/bpf/xdpfw"
 
 static volatile sig_atomic_t stop;
 
@@ -40,101 +51,277 @@ static const char *stat_names[STAT_MAX] = {
 	[STAT_DROPPED] = "DROP (engellenen)",
 };
 
-static int block_ip(int map_fd, const char *ipstr)
+/* Pinlenmis bir map'i ac */
+static int open_pinned(const char *name)
+{
+	char path[256];
+	int fd;
+
+	snprintf(path, sizeof(path), PIN_DIR "/%s", name);
+	fd = bpf_obj_get(path);
+	if (fd < 0)
+		fprintf(stderr,
+			"'%s' acilamadi: %s\n"
+			"Program yuklu mu? 'sudo %s load <arayuz>' calistir.\n",
+			path, strerror(errno), "./xdpfw");
+	return fd;
+}
+
+/* ---------------------------------------------------------------- load */
+
+static int cmd_load(const char *ifname)
+{
+	struct xdpfw_bpf *skel;
+	char path[256];
+	int ifindex, link_fd, err;
+
+	ifindex = if_nametoindex(ifname);
+	if (!ifindex) {
+		fprintf(stderr, "Arayuz bulunamadi: %s\n", ifname);
+		return 1;
+	}
+
+	if (mkdir(PIN_DIR, 0700) && errno != EEXIST) {
+		fprintf(stderr, "%s olusturulamadi: %s\n"
+			"bpffs mount edili mi? 'sudo mount -t bpf bpf /sys/fs/bpf'\n",
+			PIN_DIR, strerror(errno));
+		return 1;
+	}
+
+	skel = xdpfw_bpf__open();
+	if (!skel)
+		return 1;
+
+	/*
+	 * Pin yolunu load'dan ONCE ayarliyoruz.
+	 * libbpf: yol zaten varsa mevcut map'i yeniden kullanir,
+	 *         yoksa map'i olusturup pinler.
+	 */
+	bpf_map__set_pin_path(skel->maps.stats, PIN_DIR "/stats");
+	bpf_map__set_pin_path(skel->maps.blocked_ips, PIN_DIR "/blocked_ips");
+	bpf_map__set_pin_path(skel->maps.blocked_ports, PIN_DIR "/blocked_ports");
+
+	err = xdpfw_bpf__load(skel);
+	if (err) {
+		fprintf(stderr, "Yukleme basarisiz (%d). Detay: XDPFW_DEBUG=1\n", err);
+		goto out;
+	}
+
+	link_fd = bpf_link_create(bpf_program__fd(skel->progs.xdp_fw),
+				  ifindex, BPF_XDP, NULL);
+	if (link_fd < 0) {
+		fprintf(stderr, "XDP attach basarisiz: %s\n", strerror(errno));
+		err = 1;
+		goto out;
+	}
+
+	/* Link'i pinle: proses cikinca program detach olmasin */
+	snprintf(path, sizeof(path), PIN_DIR "/link_%s", ifname);
+	unlink(path);
+	if (bpf_obj_pin(link_fd, path)) {
+		fprintf(stderr, "Link pinlenemedi: %s\n", strerror(errno));
+		close(link_fd);
+		err = 1;
+		goto out;
+	}
+	close(link_fd);
+
+	printf("XDP programi '%s' arayuzune baglandi.\n", ifname);
+	printf("Kural ekle : sudo ./xdpfw block-ip 10.10.0.2\n");
+	printf("Istatistik : sudo ./xdpfw stats\n");
+	err = 0;
+out:
+	xdpfw_bpf__destroy(skel);
+	return err;
+}
+
+/* -------------------------------------------------------------- unload */
+
+static int cmd_unload(const char *ifname)
+{
+	char path[256];
+
+	snprintf(path, sizeof(path), PIN_DIR "/link_%s", ifname);
+	if (unlink(path)) {
+		fprintf(stderr, "%s silinemedi: %s\n", path, strerror(errno));
+		return 1;
+	}
+	printf("'%s' arayuzunden XDP programi kaldirildi.\n", ifname);
+	printf("Map'leri de temizlemek icin: sudo rm -rf %s\n", PIN_DIR);
+	return 0;
+}
+
+/* --------------------------------------------------------------- stats */
+
+static int cmd_stats(int interval)
+{
+	__u64 cur[STAT_MAX], prev[STAT_MAX] = {};
+	__u64 *percpu;
+	int fd, ncpu, i, first = 1;
+	__u32 k;
+
+	fd = open_pinned("stats");
+	if (fd < 0)
+		return 1;
+
+	ncpu = libbpf_num_possible_cpus();
+	percpu = calloc(ncpu, sizeof(__u64));
+	if (!percpu)
+		return 1;
+
+	signal(SIGINT, on_signal);
+
+	while (!stop) {
+		for (k = 0; k < STAT_MAX; k++) {
+			__u64 sum = 0;
+
+			if (bpf_map_lookup_elem(fd, &k, percpu) == 0)
+				for (i = 0; i < ncpu; i++)
+					sum += percpu[i];
+			cur[k] = sum;
+		}
+
+		printf("\033[2J\033[H");
+		printf("XDP firewall - canli istatistik (%d CPU) - Ctrl+C\n\n", ncpu);
+		printf("%-18s %14s %12s\n", "SAYAC", "TOPLAM", "PAKET/SN");
+		printf("---------------------------------------------\n");
+		for (k = 0; k < STAT_MAX; k++)
+			printf("%-18s %14llu %12llu\n", stat_names[k],
+			       (unsigned long long)cur[k],
+			       (unsigned long long)(first ? 0 : (cur[k] - prev[k]) / interval));
+		fflush(stdout);
+
+		memcpy(prev, cur, sizeof(cur));
+		first = 0;
+		sleep(interval);
+	}
+
+	free(percpu);
+	close(fd);
+	return 0;
+}
+
+/* ------------------------------------------------------------ kurallar */
+
+static int cmd_ip(const char *ipstr, int ekle)
 {
 	struct rule_stat val = {};
 	struct in_addr addr;
 	__u32 key;
+	int fd, err;
 
 	if (inet_pton(AF_INET, ipstr, &addr) != 1) {
 		fprintf(stderr, "Gecersiz IPv4 adresi: %s\n", ipstr);
-		return -1;
+		return 1;
 	}
 
-	/* addr.s_addr network byte order; BPF de cevirmeden kullaniyor */
-	key = addr.s_addr;
+	fd = open_pinned("blocked_ips");
+	if (fd < 0)
+		return 1;
 
-	if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY)) {
-		fprintf(stderr, "Map'e yazilamadi: %s\n", strerror(errno));
-		return -1;
-	}
-	printf("Engellendi (IP): %s\n", ipstr);
-	return 0;
+	key = addr.s_addr;   /* network byte order, BPF ile ayni */
+
+	if (ekle)
+		err = bpf_map_update_elem(fd, &key, &val, BPF_ANY);
+	else
+		err = bpf_map_delete_elem(fd, &key);
+
+	if (err)
+		fprintf(stderr, "Islem basarisiz: %s\n", strerror(errno));
+	else
+		printf("%s %s\n", ipstr, ekle ? "engellendi." : "engeli kaldirildi.");
+
+	close(fd);
+	return err ? 1 : 0;
 }
 
-/* "tcp:9999" veya "udp:53" formatini isler */
-static int block_port(int map_fd, const char *spec)
+static int cmd_port(const char *proto_s, const char *port_s, int ekle)
 {
 	struct rule_stat val = {};
 	struct port_key key;
-	const char *iki_nokta;
-	int port;
+	int fd, err, port;
 	__u8 proto;
 
-	iki_nokta = strchr(spec, ':');
-	if (!iki_nokta) {
-		fprintf(stderr, "Gecersiz kural: %s (ornek: tcp:8080)\n", spec);
-		return -1;
-	}
-
-	if (!strncmp(spec, "tcp:", 4))
+	if (!strcmp(proto_s, "tcp"))
 		proto = IPPROTO_TCP;
-	else if (!strncmp(spec, "udp:", 4))
+	else if (!strcmp(proto_s, "udp"))
 		proto = IPPROTO_UDP;
 	else {
-		fprintf(stderr, "Protokol 'tcp' veya 'udp' olmali: %s\n", spec);
-		return -1;
+		fprintf(stderr, "Protokol 'tcp' veya 'udp' olmali.\n");
+		return 1;
 	}
 
-	port = atoi(iki_nokta + 1);
+	port = atoi(port_s);
 	if (port < 1 || port > 65535) {
-		fprintf(stderr, "Gecersiz port: %s\n", spec);
-		return -1;
+		fprintf(stderr, "Gecersiz port: %s\n", port_s);
+		return 1;
 	}
 
-	/* KRITIK: padding dahil tum struct sifirlanmali */
-	memset(&key, 0, sizeof(key));
-	key.port  = htons((__u16)port);   /* network byte order */
+	fd = open_pinned("blocked_ports");
+	if (fd < 0)
+		return 1;
+
+	memset(&key, 0, sizeof(key));   /* padding sifirlansin */
+	key.port  = htons((__u16)port);
 	key.proto = proto;
 
-	if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY)) {
-		fprintf(stderr, "Map'e yazilamadi: %s\n", strerror(errno));
-		return -1;
-	}
-	printf("Engellendi (port): %s\n", spec);
-	return 0;
+	if (ekle)
+		err = bpf_map_update_elem(fd, &key, &val, BPF_ANY);
+	else
+		err = bpf_map_delete_elem(fd, &key);
+
+	if (err)
+		fprintf(stderr, "Islem basarisiz: %s\n", strerror(errno));
+	else
+		printf("%s/%d %s\n", proto_s, port,
+		       ekle ? "engellendi." : "engeli kaldirildi.");
+
+	close(fd);
+	return err ? 1 : 0;
 }
 
-static void list_rules(int ip_fd, int port_fd)
+static int cmd_list(void)
 {
 	char buf[INET_ADDRSTRLEN];
 	struct rule_stat val;
-	int bos = 1;
+	int fd, bos = 1;
 
-	printf("\nKurallar:\n");
+	fd = open_pinned("blocked_ips");
+	if (fd < 0)
+		return 1;
 
+	printf("Engellenen IP'ler:\n");
 	{
 		__u32 key, next_key, *pk = NULL;
 
-		while (bpf_map_get_next_key(ip_fd, pk, &next_key) == 0) {
+		while (bpf_map_get_next_key(fd, pk, &next_key) == 0) {
 			key = next_key;
-			if (bpf_map_lookup_elem(ip_fd, &key, &val) == 0) {
+			if (bpf_map_lookup_elem(fd, &key, &val) == 0) {
 				inet_ntop(AF_INET, &key, buf, sizeof(buf));
-				printf("  ip   %-16s eslesme=%llu\n", buf,
+				printf("  %-16s eslesme=%llu\n", buf,
 				       (unsigned long long)val.hits);
 				bos = 0;
 			}
 			pk = &key;
 		}
 	}
+	if (bos)
+		printf("  (yok)\n");
+	close(fd);
 
+	fd = open_pinned("blocked_ports");
+	if (fd < 0)
+		return 1;
+
+	bos = 1;
+	printf("\nEngellenen portlar:\n");
 	{
 		struct port_key key, next_key, *pk = NULL;
 
-		while (bpf_map_get_next_key(port_fd, pk, &next_key) == 0) {
+		while (bpf_map_get_next_key(fd, pk, &next_key) == 0) {
 			key = next_key;
-			if (bpf_map_lookup_elem(port_fd, &key, &val) == 0) {
-				printf("  %-4s %-16u eslesme=%llu\n",
+			if (bpf_map_lookup_elem(fd, &key, &val) == 0) {
+				printf("  %-4s/%-5u eslesme=%llu\n",
 				       key.proto == IPPROTO_TCP ? "tcp" : "udp",
 				       ntohs(key.port),
 				       (unsigned long long)val.hits);
@@ -143,112 +330,62 @@ static void list_rules(int ip_fd, int port_fd)
 			pk = &key;
 		}
 	}
-
 	if (bos)
-		printf("  (kural yok)\n");
+		printf("  (yok)\n");
+	close(fd);
+
+	return 0;
+}
+
+/* ---------------------------------------------------------------- main */
+
+static void usage(const char *prog)
+{
+	fprintf(stderr,
+"Kullanim: %s <komut> [argumanlar]\n"
+"\n"
+"  load <arayuz>              XDP programini bagla\n"
+"  unload <arayuz>            Programi kaldir\n"
+"  stats [saniye]             Canli istatistik (varsayilan 1 sn)\n"
+"  block-ip <ipv4>            Kaynak IP'yi engelle\n"
+"  unblock-ip <ipv4>          IP engelini kaldir\n"
+"  block-port <tcp|udp> <p>   Hedef portu engelle\n"
+"  unblock-port <tcp|udp> <p> Port engelini kaldir\n"
+"  list                       Kurallari listele\n"
+"\n"
+"Ornek:\n"
+"  sudo %s load veth0\n"
+"  sudo %s block-port tcp 9999\n"
+"  sudo %s stats\n"
+"  sudo %s unload veth0\n", prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv)
 {
-	struct xdpfw_bpf *skel;
-	struct bpf_link *link = NULL;
-	__u64 cur[STAT_MAX], prev[STAT_MAX] = {};
-	__u64 *percpu = NULL;
-	int ifindex, ncpu, stats_fd, ip_fd, port_fd, err = 0;
-	int first = 1, i;
-	__u32 k;
-
-	if (argc < 2) {
-		fprintf(stderr,
-			"Kullanim: %s <arayuz> [kural ...]\n"
-			"Kural formatlari:\n"
-			"  10.10.0.2    kaynak IP engelle\n"
-			"  tcp:9999     hedef TCP portu engelle\n"
-			"  udp:53       hedef UDP portu engelle\n"
-			"\nOrnek: sudo %s veth0 tcp:9999 10.10.0.5\n",
-			argv[0], argv[0]);
-		return 1;
-	}
-
-	ifindex = if_nametoindex(argv[1]);
-	if (!ifindex) {
-		fprintf(stderr, "Arayuz bulunamadi: %s\n", argv[1]);
-		return 1;
-	}
-
 	libbpf_set_print(print_fn);
 
-	skel = xdpfw_bpf__open();
-	if (!skel)
+	if (argc < 2) {
+		usage(argv[0]);
 		return 1;
-
-	err = xdpfw_bpf__load(skel);
-	if (err) {
-		fprintf(stderr, "Yukleme basarisiz (%d). Detay: XDPFW_DEBUG=1\n", err);
-		goto cleanup;
 	}
 
-	stats_fd = bpf_map__fd(skel->maps.stats);
-	ip_fd    = bpf_map__fd(skel->maps.blocked_ips);
-	port_fd  = bpf_map__fd(skel->maps.blocked_ports);
+	if (!strcmp(argv[1], "load") && argc == 3)
+		return cmd_load(argv[2]);
+	if (!strcmp(argv[1], "unload") && argc == 3)
+		return cmd_unload(argv[2]);
+	if (!strcmp(argv[1], "stats"))
+		return cmd_stats(argc > 2 ? atoi(argv[2]) : 1);
+	if (!strcmp(argv[1], "block-ip") && argc == 3)
+		return cmd_ip(argv[2], 1);
+	if (!strcmp(argv[1], "unblock-ip") && argc == 3)
+		return cmd_ip(argv[2], 0);
+	if (!strcmp(argv[1], "block-port") && argc == 4)
+		return cmd_port(argv[2], argv[3], 1);
+	if (!strcmp(argv[1], "unblock-port") && argc == 4)
+		return cmd_port(argv[2], argv[3], 0);
+	if (!strcmp(argv[1], "list"))
+		return cmd_list();
 
-	/* Komut satirindaki kurallari isle */
-	for (i = 2; i < argc; i++) {
-		if (strchr(argv[i], ':'))
-			block_port(port_fd, argv[i]);
-		else
-			block_ip(ip_fd, argv[i]);
-	}
-
-	link = bpf_program__attach_xdp(skel->progs.xdp_fw, ifindex);
-	if (!link) {
-		err = -errno;
-		fprintf(stderr, "XDP attach basarisiz: %s\n", strerror(errno));
-		goto cleanup;
-	}
-
-	ncpu = libbpf_num_possible_cpus();
-	percpu = calloc(ncpu, sizeof(__u64));
-	if (!percpu) {
-		err = -1;
-		goto cleanup;
-	}
-
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
-
-	while (!stop) {
-		for (k = 0; k < STAT_MAX; k++) {
-			__u64 sum = 0;
-
-			if (bpf_map_lookup_elem(stats_fd, &k, percpu) == 0)
-				for (i = 0; i < ncpu; i++)
-					sum += percpu[i];
-			cur[k] = sum;
-		}
-
-		printf("\033[2J\033[H");
-		printf("XDP firewall - %s (%d CPU) - Ctrl+C ile cik\n\n", argv[1], ncpu);
-		printf("%-18s %14s %12s\n", "SAYAC", "TOPLAM", "PAKET/SN");
-		printf("---------------------------------------------\n");
-		for (k = 0; k < STAT_MAX; k++)
-			printf("%-18s %14llu %12llu\n", stat_names[k],
-			       (unsigned long long)cur[k],
-			       (unsigned long long)(first ? 0 : cur[k] - prev[k]));
-
-		list_rules(ip_fd, port_fd);
-		fflush(stdout);
-
-		memcpy(prev, cur, sizeof(cur));
-		first = 0;
-		sleep(1);
-	}
-
-	printf("\nKaldiriliyor...\n");
-
-cleanup:
-	free(percpu);
-	bpf_link__destroy(link);
-	xdpfw_bpf__destroy(skel);
-	return err ? 1 : 0;
+	usage(argv[0]);
+	return 1;
 }
