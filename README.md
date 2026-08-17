@@ -94,6 +94,21 @@ BPF programı her pakette Ethernet ve IPv4 başlıklarını ayrıştırır, kayn
 IP'yi CIDR blacklist'te arar, protokolü tespit edip hedef portu port
 blacklist'te arar. Eşleşme varsa paket düşürülür ve ring buffer'a bir olay
 yazılır.
+
+```
+NIC surucusu --> XDP programi --> XDP_PASS --> kernel ag yigini
+                      |
+                      +--> XDP_DROP
+                      |
+                      v
+    stats / blocked_ips / blocked_ports / talkers / events
+                      |
+                      v
+            bpffs (/sys/fs/bpf/xdpfw)
+                      |
+                      v
+            kullanici alani CLI
+```
 ### Map tipleri ve seçim gerekçeleri
 
 | Map | Tip | Gerekçe |
