@@ -1,17 +1,18 @@
 # xdpfw — XDP tabanlı ağ trafik izleyici ve firewall
 
-Linux kernel'in XDP katmanında çalışan, paketleri ağ yığınına ulaşmadan önce
-işleyen bir trafik izleme aracı. Paketler `sk_buff` yapısı oluşturulmadan,
-sürücü seviyesinde değerlendirilir.
+Linux kernel'in XDP katmanında çalışan, paketleri ağ yığınına ulaşmadan
+önce işleyen bir trafik izleme ve filtreleme aracı. Paketler `sk_buff`
+yapısı oluşturulmadan, sürücü seviyesinde değerlendirilir.
 
-## Durum
+## Özellikler
 
-- [x] Protokol bazlı paket sayımı (TCP / UDP / ICMP / diğer)
-- [x] Canlı istatistik gösterimi (toplam + paket/saniye)
-- [ ] IP blacklist
-- [ ] Port blacklist
-- [ ] CIDR desteği
-- [ ] Canlı drop log akışı
+- Protokol bazlı paket sayımı (TCP / UDP / ICMP / diğer)
+- CIDR blacklist (`10.0.0.0/8`) — LPM trie ile en uzun önek eşleşmesi
+- Port blacklist (TCP / UDP)
+- Canlı drop olay akışı — ring buffer üzerinden
+- En çok paket gönderen kaynaklar (top talkers)
+- Dosya tabanlı kural tanımı ve çalışma anında yeniden yükleme
+- Kural bazlı eşleşme sayaçları ve drop sebebi ayrımı
 
 ## Gereksinimler
 
@@ -25,7 +26,7 @@ sudo apt install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
                     bpftool gcc make iproute2 ethtool
 ```
 
-Ubuntu'da `bpftool` ayrı paket değil, `linux-tools-$(uname -r)` içinden gelir.
+Ubuntu'da `bpftool` ayrı paket değildir, `linux-tools-$(uname -r)` içinden gelir.
 
 BTF kontrolü:
 
@@ -39,76 +40,121 @@ ls /sys/kernel/btf/vmlinux
 make
 ```
 
-Sırasıyla: `vmlinux.h` üretilir → BPF programı bytecode'a derlenir →
+Zincir: `vmlinux.h` üretilir → BPF programı bytecode'a derlenir →
 skeleton üretilir → kullanıcı alanı programı linklenir.
 
 ## Kullanım
 
 ```bash
-sudo ./xdpfw <arayüz>
+sudo ./xdpfw load veth0              # programı bağla, map'leri pinle
+sudo ./xdpfw reload rules.conf       # kural dosyasını yükle
+
+sudo ./xdpfw block-ip 10.0.0.0/8     # CIDR bloğu engelle
+sudo ./xdpfw block-port tcp 8080     # port engelle
+sudo ./xdpfw list                    # kuralları ve eşleşmeleri göster
+
+sudo ./xdpfw stats                   # canlı sayaç tablosu
+sudo ./xdpfw log                     # canlı drop olay akışı
+sudo ./xdpfw top 10                  # en çok paket gönderen kaynaklar
+
+sudo ./xdpfw unload veth0            # programı kaldır
+sudo rm -rf /sys/fs/bpf/xdpfw        # map'leri de temizle
 ```
 
-Canlı sayaç tablosu gösterir, `Ctrl+C` ile çıkar ve XDP programını
-otomatik kaldırır.
+`load` komutu programı bağladıktan sonra çıkar; map'ler ve link bpffs'e
+pinlendiği için XDP programı çalışmaya devam eder. Kurallar program
+yeniden başlatılmadan eklenip kaldırılabilir.
 
 ## Demo
-
-Tek komutla izole test ortamı kurar, trafik üretir, sonuçları gösterir:
 
 ```bash
 make
 sudo ./scripts/demo.sh
 ```
 
-## Test ortamı
+İzole test ortamı kurar, kuralları yükler, üç farklı senaryoda trafik
+üretir (engellenen IP / geçen IP / engellenen port), sonuçları gösterir
+ve temizler.
 
-`veth` çifti + network namespace ile izole ortam. Gerçek arayüze
-dokunulmadığı için hatalı kural ağ bağlantısını kesmez.
+## Kural dosyası
+`reload` önce map'i temizler, sonra dosyayı yükler. Dosyadan silinen bir
+kural map'te kalmaz — dosya, gerçek durumun tek kaynağıdır.
+
+Kural kaynağı, kuralı uygulayan koddan bağımsızdır. Tehdit istihbaratı
+beslemesi eklemek BPF programında değişiklik gerektirmez:
 
 ```bash
-sudo ./scripts/testenv.sh up      # 10.10.0.1 <-> 10.10.0.2
-sudo ./xdpfw veth0
-sudo ip netns exec xdptest ping 10.10.0.1
-sudo ./scripts/testenv.sh down
+curl -s <feed-url> | grep -E '^[0-9]' | sed 's/^/block ip /' > feed.conf
+sudo ./xdpfw reload feed.conf
 ```
 
 ## Mimari
-BPF programı her pakette Ethernet ve IPv4 başlıklarını ayrıştırır,
-protokolü tespit eder ve ilgili sayacı artırır. Sayaçlar per-CPU
-tutulur (kilitsiz artış); kullanıcı alanı okurken CPU'ları toplar.
-```
-NIC surucusu --> XDP programi --> XDP_PASS --> kernel ag yigini
-                      |
-                      v
-              PERCPU_ARRAY (stats)
-                      |
-                      v
-              kullanici alani CLI
-```
+
+BPF programı her pakette Ethernet ve IPv4 başlıklarını ayrıştırır, kaynak
+IP'yi CIDR blacklist'te arar, protokolü tespit edip hedef portu port
+blacklist'te arar. Eşleşme varsa paket düşürülür ve ring buffer'a bir olay
+yazılır.
+### Map tipleri ve seçim gerekçeleri
+
+| Map | Tip | Gerekçe |
+|---|---|---|
+| `stats` | PERCPU_ARRAY | Her CPU kendi kopyasını artırır, kilit gerekmez |
+| `blocked_ips` | LPM_TRIE | En uzun önek eşleşmesi; `/8` için tek kayıt yeter |
+| `blocked_ports` | HASH | Sabit anahtar kümesi, tam eşleşme yeterli |
+| `talkers` | LRU_HASH | Anahtar kümesi sınırsız; taşmayı kernel yönetir |
+| `events` | RINGBUF | Kernel→userspace olay akışı, sıralama korunur |
+
 ## Dosya yapısı
 
 | Dosya | Açıklama |
 |---|---|
 | `src/xdpfw.bpf.c` | Kernel'de çalışan XDP programı |
-| `src/xdpfw.c` | Yükleyici + istatistik gösterimi |
+| `src/xdpfw.c` | Yükleyici ve CLI |
 | `src/xdpfw.h` | BPF ve kullanıcı alanının paylaştığı tipler |
 | `src/vmlinux.h` | bpftool'un ürettiği kernel tipleri (git'te tutulmaz) |
 | `src/xdpfw.skel.h` | bpftool'un ürettiği skeleton (git'te tutulmaz) |
-| `scripts/testenv.sh` | veth + netns test ortamı |
+| `rules.conf` | Kural dosyası |
+| `scripts/testenv.sh` | veth + netns izole test ortamı |
 | `scripts/demo.sh` | Uçtan uca demo |
+| `scripts/bench.sh` | Yük testi ve pps ölçümü |
+| `scripts/compare.sh` | iptables / nftables / XDP karşılaştırması |
+| `docs/olcum.md` | Performans ölçüm sonuçları |
+| `docs/gunluk.md` | Geliştirme günlüğü |
+
+## Performans
+
+Ayrıntılar ve ölçüm sınırları için `docs/olcum.md`.
+
+Öne çıkan bulgu: aynı program içinde `XDP_DROP`, `XDP_PASS`'e göre
+%57 daha yüksek paket işleme hızı verdi (454.610 vs 289.035 pps,
+3 tekrar, sapma <%2). `XDP_PASS` durumunda paket kernel ağ yığınına
+devam edip `sk_buff` ayrılması, protokol katmanı işlenmesi ve soket
+araması maliyetlerini doğurur.
 
 ## Hata ayıklama
 
 ```bash
-XDPFW_DEBUG=1 sudo ./xdpfw veth0      # verifier logu
-sudo bpftool net show                 # hangi arayüzde ne bağlı
-sudo bpftool prog show                # yüklü programlar
-sudo bpftool map dump name stats       # map'in ham içeriği
+XDPFW_DEBUG=1 sudo ./xdpfw load veth0    # verifier logu
+sudo bpftool net show                    # hangi arayüzde ne bağlı
+sudo bpftool prog show                   # yüklü programlar
+sudo bpftool map dump name stats         # map'in ham içeriği
 ```
 
 ## Bilinen sınırlar
 
-- Yalnızca IPv4 (IPv6 desteklenmiyor)
-- Bir arayüze aynı anda tek XDP programı bağlanabilir (`libxdp`
-  dispatcher kullanılmıyor); ikinci yükleme `-EBUSY` verir
-- IP fragmentasyonu dikkate alınmıyor
+- Yalnızca IPv4 desteklenir
+- Bir arayüze aynı anda tek XDP programı bağlanabilir (`libxdp` dispatcher
+  kullanılmıyor); ikinci yükleme `-EBUSY` verir
+- IP fragmentasyonu dikkate alınmaz
+- `talkers` map'i LRU olduğu için sayımlar yaklaşıktır; map dolduğunda
+  eski kayıtlar düşer. İzleme için uygun, muhasebe için değil
+- Yalnızca gelen (ingress) trafik işlenir; giden trafik için TC hook gerekir
+
+## Yol haritası
+
+- IPv6 desteği
+- IP başına hız sınırlama (token bucket)
+- SYN flood tespiti
+- Whitelist modu (varsayılan DROP)
+- Web tabanlı izleme paneli
+- `libxdp` ile çoklu program desteği

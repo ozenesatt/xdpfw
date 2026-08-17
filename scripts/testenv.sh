@@ -18,6 +18,8 @@ up() {
 
     ip netns exec "$NS" ip addr add "$PEER_IP" dev "$PEER_IF"
     ip netns exec "$NS" ip link set "$PEER_IF" up
+    # Ikinci kaynak adres: kural granulerligini test etmek icin
+    ip netns exec "$NS" ip addr add 10.10.0.3/24 dev "$PEER_IF"
     ip netns exec "$NS" ip link set lo up
 
     ethtool -K "$HOST_IF" gro off 2>/dev/null || true
