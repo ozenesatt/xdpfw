@@ -206,12 +206,26 @@ static int cmd_stats(int interval)
 
 /* ------------------------------------------------------------ kurallar */
 
-static int cmd_ip(const char *ipstr, int ekle)
+static int cmd_ip(const char *spec, int ekle)
 {
 	struct rule_stat val = {};
+	struct lpm_key key;
 	struct in_addr addr;
-	__u32 key;
-	int fd, err;
+	char ipstr[64];
+	char *egik;
+	int fd, err, prefixlen = 32;
+
+	/* "10.0.0.0/8" veya "10.10.0.2" ayristir */
+	snprintf(ipstr, sizeof(ipstr), "%s", spec);
+	egik = strchr(ipstr, '/');
+	if (egik) {
+		*egik = '\0';
+		prefixlen = atoi(egik + 1);
+		if (prefixlen < 0 || prefixlen > 32) {
+			fprintf(stderr, "Gecersiz prefix uzunlugu: %s\n", spec);
+			return 1;
+		}
+	}
 
 	if (inet_pton(AF_INET, ipstr, &addr) != 1) {
 		fprintf(stderr, "Gecersiz IPv4 adresi: %s\n", ipstr);
@@ -222,7 +236,9 @@ static int cmd_ip(const char *ipstr, int ekle)
 	if (fd < 0)
 		return 1;
 
-	key = addr.s_addr;   /* network byte order, BPF ile ayni */
+	memset(&key, 0, sizeof(key));
+	key.prefixlen = (__u32)prefixlen;
+	memcpy(key.data, &addr.s_addr, 4);   /* network byte order */
 
 	if (ekle)
 		err = bpf_map_update_elem(fd, &key, &val, BPF_ANY);
@@ -232,7 +248,8 @@ static int cmd_ip(const char *ipstr, int ekle)
 	if (err)
 		fprintf(stderr, "Islem basarisiz: %s\n", strerror(errno));
 	else
-		printf("%s %s\n", ipstr, ekle ? "engellendi." : "engeli kaldirildi.");
+		printf("%s/%d %s\n", ipstr, prefixlen,
+		       ekle ? "engellendi." : "engeli kaldirildi.");
 
 	close(fd);
 	return err ? 1 : 0;
@@ -368,13 +385,16 @@ static int cmd_list(void)
 
 	printf("Engellenen IP'ler:\n");
 	{
-		__u32 key, next_key, *pk = NULL;
+		struct lpm_key key, next_key, *pk = NULL;
+		char gosterim[32];
 
 		while (bpf_map_get_next_key(fd, pk, &next_key) == 0) {
 			key = next_key;
 			if (bpf_map_lookup_elem(fd, &key, &val) == 0) {
-				inet_ntop(AF_INET, &key, buf, sizeof(buf));
-				printf("  %-16s eslesme=%llu\n", buf,
+				inet_ntop(AF_INET, key.data, buf, sizeof(buf));
+				snprintf(gosterim, sizeof(gosterim), "%s/%u",
+					 buf, key.prefixlen);
+				printf("  %-18s eslesme=%llu\n", gosterim,
 				       (unsigned long long)val.hits);
 				bos = 0;
 			}
@@ -423,8 +443,8 @@ static void usage(const char *prog)
 "  load <arayuz>              XDP programini bagla\n"
 "  unload <arayuz>            Programi kaldir\n"
 "  stats [saniye]             Canli istatistik (varsayilan 1 sn)\n"
-"  block-ip <ipv4>            Kaynak IP'yi engelle\n"
-"  unblock-ip <ipv4>          IP engelini kaldir\n"
+"  block-ip <ipv4[/prefix]>   Kaynak IP veya CIDR blogu engelle\n"
+"  unblock-ip <ipv4[/prefix]> IP/CIDR engelini kaldir\n"
 "  block-port <tcp|udp> <p>   Hedef portu engelle\n"
 "  unblock-port <tcp|udp> <p> Port engelini kaldir\n"
 "  log                        Canli drop olay akisi\n"

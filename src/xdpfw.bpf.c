@@ -15,10 +15,15 @@ struct {
 	__type(value, __u64);
 } stats SEC(".maps");
 
+/*
+ * CIDR blacklist (LPM_TRIE).
+ * BPF_F_NO_PREALLOC zorunlu: trie dinamik buyur, onceden ayrilamaz.
+ */
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__uint(max_entries, 1024);
-	__type(key, __u32);
+	__type(key, struct lpm_key);
 	__type(value, struct rule_stat);
 } blocked_ips SEC(".maps");
 
@@ -76,6 +81,7 @@ int xdp_fw(struct xdp_md *ctx)
 	struct iphdr *ip;
 	struct rule_stat *rs;
 	struct port_key pk;
+	struct lpm_key lk;
 	void *l4;
 	__u32 ihl_bytes, saddr;
 	__u16 dport = 0;
@@ -105,7 +111,13 @@ int xdp_fw(struct xdp_md *ctx)
 
 	/* --- KURAL 1: kaynak IP blacklist --- */
 	saddr = ip->saddr;
-	rs = bpf_map_lookup_elem(&blocked_ips, &saddr);
+
+	/* LPM lookup: prefixlen her zaman 32, kernel en uzun oneki bulur */
+	__builtin_memset(&lk, 0, sizeof(lk));
+	lk.prefixlen = 32;
+	__builtin_memcpy(lk.data, &saddr, 4);
+
+	rs = bpf_map_lookup_elem(&blocked_ips, &lk);
 	if (rs) {
 		__sync_fetch_and_add(&rs->hits, 1);
 		bump(STAT_DROPPED);

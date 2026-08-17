@@ -25,6 +25,21 @@ enum drop_reason {
 	REASON_PORT,
 };
 
+
+/*
+ * LPM_TRIE anahtari (CIDR blacklist).
+ *
+ * prefixlen ILK alan ve __u32 olmak ZORUNDA - kernel boyle bekliyor.
+ * data[] network byte order, IPv4 icin 4 bayt.
+ *
+ * Lookup'ta prefixlen = 32 verilir; kernel en uzun eslesen oneki bulur
+ * (Longest Prefix Match). Bu sayede /32 tek adres engellemesi de calisir.
+ */
+struct lpm_key {
+	__u32 prefixlen;   /* 0-32 */
+	__u8  data[4];     /* IPv4, network byte order */
+};
+
 struct rule_stat {
 	__u64 hits;
 };
