@@ -14,7 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <bpf/bpf.h>
@@ -187,6 +189,96 @@ static int json_mod(char *buf, size_t n)
 			val == MODE_WHITELIST ? "whitelist" : "blacklist");
 }
 
+
+/* --- SSE (Server-Sent Events) istemcileri --- */
+
+#define MAX_SSE 8
+static int sse_fd[MAX_SSE];
+static int sse_adet;
+
+static void sse_ekle(int fd)
+{
+	const char *baslik =
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/event-stream\r\n"
+		"Cache-Control: no-store\r\n"
+		"Connection: keep-alive\r\n\r\n";
+
+	if (sse_adet >= MAX_SSE) {
+		close(fd);
+		return;
+	}
+	if (write(fd, baslik, strlen(baslik)) < 0) {
+		close(fd);
+		return;
+	}
+	sse_fd[sse_adet++] = fd;
+}
+
+static void sse_cikar(int i)
+{
+	close(sse_fd[i]);
+	sse_fd[i] = sse_fd[--sse_adet];
+}
+
+/* Tum SSE istemcilerine yaz; yazamadigimizi listeden cikar */
+static void sse_yayinla(const char *veri, size_t n)
+{
+	int i = 0;
+
+	while (i < sse_adet) {
+		if (write(sse_fd[i], veri, n) < 0)
+			sse_cikar(i);   /* istemci kapanmis */
+		else
+			i++;
+	}
+}
+
+static const char *proto_adi(__u8 p)
+{
+	switch (p) {
+	case IPPROTO_TCP:  return "tcp";
+	case IPPROTO_UDP:  return "udp";
+	case IPPROTO_ICMP: return "icmp";
+	default:           return "?";
+	}
+}
+
+static const char *sebep_adi(__u8 r)
+{
+	switch (r) {
+	case REASON_IP:          return "ip";
+	case REASON_DST:         return "hedef";
+	case REASON_RANGE:       return "aralik";
+	case REASON_FLOW:        return "akis";
+	case REASON_PORT:        return "port";
+	case REASON_NOT_ALLOWED: return "izinsiz";
+	default:                 return "?";
+	}
+}
+
+/* Ring buffer callback: olayi JSON'a cevirip SSE ile yayinla */
+static int olay_geldi(void *ctx, void *data, size_t len)
+{
+	const struct drop_event *e = data;
+	char ip[INET_ADDRSTRLEN], satir[256];
+	int n;
+
+	(void)ctx;
+	if (len < sizeof(*e) || sse_adet == 0)
+		return 0;
+
+	inet_ntop(AF_INET, &e->saddr, ip, sizeof(ip));
+	n = snprintf(satir, sizeof(satir),
+		     "data: {\"ts\":%.3f,\"src\":\"%s\",\"dport\":%u,"
+		     "\"proto\":\"%s\",\"reason\":\"%s\"}\n\n",
+		     (double)e->ts / 1e9, ip, ntohs(e->dport),
+		     proto_adi(e->proto), sebep_adi(e->reason));
+
+	sse_yayinla(satir, n);
+	return 0;
+}
+
 /* --- HTTP --- */
 
 static void yanit_gonder(int c, const char *tip, const char *govde, size_t uzunluk)
@@ -207,7 +299,8 @@ static void yanit_gonder(int c, const char *tip, const char *govde, size_t uzunl
 int serve_calistir(int port)
 {
 	struct sockaddr_in adres = {0};
-	int s, opt = 1;
+	struct ring_buffer *rb = NULL;
+	int s, opt = 1, rb_fd = -1, rb_epoll = -1;
 
 	s = socket(AF_INET, SOCK_STREAM, 0);
 	if (s < 0) {
@@ -234,48 +327,90 @@ int serve_calistir(int port)
 	printf("Panel hazir: http://localhost:%d\n", port);
 	printf("Ctrl+C ile cik\n");
 
-	while (!serve_stop) {
-		char istek[1024], *json;
-		int c, n, yaz = 0;
+	/* Ring buffer'i ac - drop olaylari icin */
+	rb_fd = pin_ac("events");
+	if (rb_fd >= 0) {
+		rb = ring_buffer__new(rb_fd, olay_geldi, NULL, NULL);
+		if (rb)
+			rb_epoll = ring_buffer__epoll_fd(rb);
+	}
 
-		c = accept(s, NULL, NULL);
-		if (c < 0) {
+	while (!serve_stop) {
+		fd_set okunacak;
+		struct timeval zaman = { .tv_sec = 1, .tv_usec = 0 };
+		int enbuyuk = s, hazir;
+
+		FD_ZERO(&okunacak);
+		FD_SET(s, &okunacak);
+		if (rb_epoll >= 0) {
+			FD_SET(rb_epoll, &okunacak);
+			if (rb_epoll > enbuyuk)
+				enbuyuk = rb_epoll;
+		}
+
+		hazir = select(enbuyuk + 1, &okunacak, NULL, NULL, &zaman);
+		if (hazir < 0) {
 			if (errno == EINTR)
 				break;
 			continue;
 		}
 
-		n = read(c, istek, sizeof(istek) - 1);
-		if (n <= 0) {
-			close(c);
-			continue;
-		}
-		istek[n] = '\0';
+		/* Ring buffer'da olay var mi? */
+		if (rb && rb_epoll >= 0 && FD_ISSET(rb_epoll, &okunacak))
+			ring_buffer__consume(rb);
 
-		if (!strncmp(istek, "GET /api/stats", 14)) {
-			json = malloc(65536);
-			if (!json) {
+		/* Yeni HTTP baglantisi var mi? */
+		if (FD_ISSET(s, &okunacak)) {
+			char istek[1024], *json;
+			int c, n, yaz = 0;
+
+			c = accept(s, NULL, NULL);
+			if (c < 0)
+				continue;
+
+			n = read(c, istek, sizeof(istek) - 1);
+			if (n <= 0) {
 				close(c);
 				continue;
 			}
-			yaz += snprintf(json + yaz, 65536 - yaz, "{");
-			yaz += json_mod(json + yaz, 65536 - yaz);
-			yaz += snprintf(json + yaz, 65536 - yaz, ",");
-			yaz += json_stats(json + yaz, 65536 - yaz);
-			yaz += snprintf(json + yaz, 65536 - yaz, ",");
-			yaz += json_kurallar(json + yaz, 65536 - yaz);
-			yaz += snprintf(json + yaz, 65536 - yaz, ",");
-			yaz += json_talkers(json + yaz, 65536 - yaz);
-			yaz += snprintf(json + yaz, 65536 - yaz, "}");
+			istek[n] = '\0';
 
-			yanit_gonder(c, "application/json", json, yaz);
-			free(json);
-		} else {
-			yanit_gonder(c, "text/html; charset=utf-8",
-				     PANEL_HTML, strlen(PANEL_HTML));
+			if (!strncmp(istek, "GET /api/events", 15)) {
+				/* SSE: baglanti acik kalacak, kapatma */
+				sse_ekle(c);
+			} else if (!strncmp(istek, "GET /api/stats", 14)) {
+				json = malloc(65536);
+				if (!json) {
+					close(c);
+					continue;
+				}
+				yaz += snprintf(json + yaz, 65536 - yaz, "{");
+				yaz += json_mod(json + yaz, 65536 - yaz);
+				yaz += snprintf(json + yaz, 65536 - yaz, ",");
+				yaz += json_stats(json + yaz, 65536 - yaz);
+				yaz += snprintf(json + yaz, 65536 - yaz, ",");
+				yaz += json_kurallar(json + yaz, 65536 - yaz);
+				yaz += snprintf(json + yaz, 65536 - yaz, ",");
+				yaz += json_talkers(json + yaz, 65536 - yaz);
+				yaz += snprintf(json + yaz, 65536 - yaz, "}");
+
+				yanit_gonder(c, "application/json", json, yaz);
+				free(json);
+				close(c);
+			} else {
+				yanit_gonder(c, "text/html; charset=utf-8",
+					     PANEL_HTML, strlen(PANEL_HTML));
+				close(c);
+			}
 		}
-		close(c);
 	}
+
+	while (sse_adet > 0)
+		sse_cikar(0);
+	if (rb)
+		ring_buffer__free(rb);
+	if (rb_fd >= 0)
+		close(rb_fd);
 
 	close(s);
 	printf("\nPanel kapatildi.\n");

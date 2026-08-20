@@ -41,6 +41,21 @@ td.n { text-align:right; }
 svg { display:block; width:100%; }
 #halka { max-width:200px; margin:0 auto; }
 @media(max-width:800px){ .grafikler{grid-template-columns:1fr} }
+
+#log-kutu { margin-top:16px; }
+#log { font-family:ui-monospace,'Cascadia Code',monospace; font-size:12px;
+       max-height:260px; overflow-y:auto; }
+#log div { padding:3px 0; border-bottom:1px solid rgba(42,52,65,.4);
+           display:flex; gap:10px; align-items:baseline; }
+#log .zaman { color:var(--dim); flex:0 0 88px; }
+#log .kaynak { color:var(--fg); flex:0 0 130px; }
+#log .hedef { color:var(--dim); flex:0 0 90px; }
+#log .sebep { color:var(--bad); font-size:11px; padding:1px 7px;
+              border:1px solid rgba(224,93,93,.35); border-radius:10px; }
+#log .bos { color:var(--dim); border:none; }
+.canli { display:inline-block; width:7px; height:7px; border-radius:50%;
+         background:var(--bad); margin-left:8px; animation:nabiz 1.4s infinite; }
+@keyframes nabiz { 0%,100%{opacity:1} 50%{opacity:.25} }
 footer { margin-top:20px; font-size:12px; color:var(--dim); }
 @media(max-width:700px){ .alt{grid-template-columns:1fr} }
 </style>
@@ -79,6 +94,11 @@ footer { margin-top:20px; font-size:12px; color:var(--dim); }
     <tbody id="talkers"></tbody></table>
   </section>
 </div>
+
+<section id="log-kutu">
+  <h2>Canlı drop olayları<span class="canli" id="canli"></span></h2>
+  <div id="log"><div class="bos">bağlantı bekleniyor…</div></div>
+</section>
 
 <footer id="durum">bağlanıyor…</footer>
 
@@ -230,8 +250,46 @@ async function guncelle(){
   onceki = s;
 }
 
+
+// --- SSE: canli drop olay akisi ---
+const logEl = document.getElementById('log');
+let ilkOlay = true;
+
+function olayEkle(o){
+  if (ilkOlay){ logEl.innerHTML = ''; ilkOlay = false; }
+
+  const d = document.createElement('div');
+  const hedef = o.dport ? `${o.proto}/${o.dport}` : o.proto;
+  const sn = (o.ts % 86400).toFixed(3);
+
+  d.innerHTML = `<span class="zaman">${sn}</span>` +
+                `<span class="kaynak">${o.src}</span>` +
+                `<span class="hedef">${hedef}</span>` +
+                `<span class="sebep">${o.reason}</span>`;
+
+  logEl.prepend(d);
+  while (logEl.children.length > 100) logEl.lastChild.remove();
+}
+
+function sseBaglan(){
+  const es = new EventSource('/api/events');
+
+  es.onmessage = e => {
+    try { olayEkle(JSON.parse(e.data)); } catch(x){}
+  };
+  es.onerror = () => {
+    document.getElementById('canli').style.background = 'var(--dim)';
+    es.close();
+    setTimeout(sseBaglan, 3000);   // yeniden baglan
+  };
+  es.onopen = () => {
+    document.getElementById('canli').style.background = 'var(--bad)';
+  };
+}
+
 guncelle();
 setInterval(guncelle, 1000);
+sseBaglan();
 </script>
 </body>
 </html>
