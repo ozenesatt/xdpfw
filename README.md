@@ -6,14 +6,27 @@ yapısı oluşturulmadan, sürücü seviyesinde değerlendirilir.
 
 ## Özellikler
 
-- Protokol bazlı paket sayımı (TCP / UDP / ICMP / diğer)
-- CIDR blacklist (`10.0.0.0/8`) — LPM trie ile en uzun önek eşleşmesi
-- Port blacklist (TCP / UDP)
-- Canlı drop olay akışı — ring buffer üzerinden
+**Filtreleme**
+- Kaynak IP / CIDR blacklist (LPM trie, en uzun önek eşleşmesi)
+- Hedef IP / CIDR blacklist
+- Hedef port (TCP / UDP)
+- Port aralığı (`8000-9000`)
+- Bileşik kural (kaynak IP + protokol + hedef port)
+- IP başına hız sınırlama (token bucket)
+- Whitelist modu (varsayılan DROP)
+
+**İzleme**
+- Protokol bazlı paket sayımı ve drop sebebi ayrımı
+- Canlı drop olay akışı (ring buffer)
 - En çok paket gönderen kaynaklar (top talkers)
+- Web paneli: sayaç kartları, 60 saniyelik pps grafiği, protokol
+  dağılımı, kural tablosu, canlı olay akışı
+
+**Operasyon**
+- systemd servisi, boot'ta otomatik başlatma
+- JSON Lines log (`/var/log/xdpfw/events.jsonl`), logrotate
 - Dosya tabanlı kural tanımı ve çalışma anında yeniden yükleme
-- Kural bazlı eşleşme sayaçları ve drop sebebi ayrımı
-- Whitelist modu (varsayılan DROP, yalnızca izinliler geçer)
+- Türkçe ve İngilizce komut adları
 
 ## Gereksinimler
 
@@ -47,28 +60,58 @@ skeleton üretilir → kullanıcı alanı programı linklenir.
 ## Kullanım
 
 ```bash
-sudo ./xdpfw load veth0              # programı bağla, map'leri pinle
-sudo ./xdpfw reload rules.conf       # kural dosyasını yükle
+sudo make install                     # /usr/sbin/xdpfw + systemd birimi
 
-sudo ./xdpfw block-ip 10.0.0.0/8     # CIDR bloğu engelle
-sudo ./xdpfw block-port tcp 8080     # port engelle
-sudo ./xdpfw list                    # kuralları ve eşleşmeleri göster
-
-sudo ./xdpfw mode                    # aktif modu göster
-sudo ./xdpfw mode whitelist          # whitelist moduna geç
-sudo ./xdpfw allow-ip 10.0.0.0/8     # whitelist modunda izin ver
-
-sudo ./xdpfw stats                   # canlı sayaç tablosu
-sudo ./xdpfw log                     # canlı drop olay akışı
-sudo ./xdpfw top 10                  # en çok paket gönderen kaynaklar
-
-sudo ./xdpfw unload veth0            # programı kaldır
-sudo rm -rf /sys/fs/bpf/xdpfw        # map'leri de temizle
+sudo xdpfw basla veth0                # programı bağla, map'leri pinle
+sudo xdpfw yenile /etc/xdpfw/rules.conf
 ```
 
-`load` komutu programı bağladıktan sonra çıkar; map'ler ve link bpffs'e
-pinlendiği için XDP programı çalışmaya devam eder. Kurallar program
-yeniden başlatılmadan eklenip kaldırılabilir.
+**Kural komutları**
+
+```bash
+sudo xdpfw engelle 10.0.0.0/8              # kaynak IP / CIDR
+sudo xdpfw engelle-hedef 192.168.1.10      # hedef IP
+sudo xdpfw engelle-port tcp 22             # hedef port
+sudo xdpfw engelle-aralik tcp 8000 9000    # port aralığı
+sudo xdpfw engelle-akis 10.0.0.5 tcp 22    # bileşik kural
+sudo xdpfw hiz-sinir 10.0.0.0/8 1000 2000  # 1000 pkt/sn, burst 2000
+sudo xdpfw mod whitelist                   # mod değiştir
+sudo xdpfw izin 10.0.0.5                   # whitelist modunda izin ver
+```
+
+Her komutun `kaldir-` öneki ile karşılığı vardır (`kaldir`, `kaldir-hedef`,
+`kaldir-port`, `kaldir-aralik`, `kaldir-akis`, `sinir-kaldir`).
+
+**İzleme komutları**
+
+```bash
+sudo xdpfw durum                      # canlı sayaç tablosu
+sudo xdpfw kurallar                   # kurallar ve eşleşme sayıları
+sudo xdpfw kayit                      # canlı drop olay akışı
+sudo xdpfw zirve 10                   # en çok paket gönderenler
+sudo xdpfw panel                      # web paneli (localhost:8080)
+```
+
+**Servis olarak**
+
+```bash
+sudo systemctl enable --now xdpfw
+sudo systemctl status xdpfw
+sudo journalctl -u xdpfw -f
+sudo tail -f /var/log/xdpfw/events.jsonl | jq
+```
+
+Arayüz adı `/etc/xdpfw/xdpfw.env` içinden ayarlanır.
+
+**Kaldırma**
+
+```bash
+sudo xdpfw durdur veth0
+sudo rm -rf /sys/fs/bpf/xdpfw
+```
+
+Tüm komutların İngilizce karşılığı da çalışır (`load`, `unload`, `stats`,
+`list`, `log`, `top`, `serve`, `reload`, `block-ip`, `block-port`, ...).
 
 ## Demo
 
@@ -139,10 +182,29 @@ NIC surucusu --> XDP programi --> XDP_PASS --> kernel ag yigini
 | Map | Tip | Gerekçe |
 |---|---|---|
 | `stats` | PERCPU_ARRAY | Her CPU kendi kopyasını artırır, kilit gerekmez |
-| `blocked_ips` | LPM_TRIE | En uzun önek eşleşmesi; `/8` için tek kayıt yeter |
+| `blocked_ips` | LPM_TRIE | En uzun önek eşleşmesi; `/8` için tek kayıt |
+| `blocked_dsts` | LPM_TRIE | Hedef IP, aynı gerekçe |
 | `blocked_ports` | HASH | Sabit anahtar kümesi, tam eşleşme yeterli |
-| `talkers` | LRU_HASH | Anahtar kümesi sınırsız; taşmayı kernel yönetir |
+| `blocked_flows` | HASH | `{IP, proto, port}` üçlüsü, tam eşleşme |
+| `port_ranges` | ARRAY | Aralık hash'lenemez; 16 slot üzerinde döngü |
+| `rate_limits` | LPM_TRIE | CIDR bazlı limit tanımı |
+| `buckets` | LRU_HASH | IP başına kova; anahtar kümesi sınırsız |
+| `talkers` | LRU_HASH | Sınırsız anahtar, taşmayı kernel yönetir |
 | `events` | RINGBUF | Kernel→userspace olay akışı, sıralama korunur |
+| `fw_config` | ARRAY | Çalışma anında değişebilen ayar (mod) |
+
+### Kural değerlendirme sırası
+
+Spesifikten genele:
+
+1. Kaynak IP / CIDR
+2. Hız sınırı (token bucket)
+3. Hedef IP / CIDR
+4. Bileşik kural (IP + proto + port)
+5. Port aralığı
+6. Hedef port
+
+Bir kural eşleşince paket düşer, sonraki kontroller çalışmaz.
 
 ## Dosya yapısı
 
@@ -165,11 +227,24 @@ NIC surucusu --> XDP programi --> XDP_PASS --> kernel ag yigini
 
 Ayrıntılar ve ölçüm sınırları için `docs/olcum.md`.
 
-Öne çıkan bulgu: aynı program içinde `XDP_DROP`, `XDP_PASS`'e göre
-%57 daha yüksek paket işleme hızı verdi (454.610 vs 289.035 pps,
-3 tekrar, sapma <%2). `XDP_PASS` durumunda paket kernel ağ yığınına
-devam edip `sk_buff` ayrılması, protokol katmanı işlenmesi ve soket
-araması maliyetlerini doğurur.
+| Yapılandırma | pps |
+|---|---|
+| Kural yok | 272.888 |
+| 8 kural yüklü, hiçbiri eşleşmiyor | 286.933 |
+| İlk kuralda DROP | 414.985 |
+
+İki bulgu:
+
+**Kural sayısı işlem hızını etkilemiyor.** Sekiz kural yüklüyken ve her
+paket tüm kontrollerden geçerken ölçülen değer, kuralsız duruma göre
+ölçüm gürültüsü kadar fark gösterdi. BPF map aramaları düşük maliyetli.
+
+**Paketi düşürmek geçirmekten %52 hızlı.** `XDP_PASS` durumunda paket
+kernel ağ yığınına devam eder: `sk_buff` ayrılır, protokol katmanları
+işlenir, soket aranır. `XDP_DROP`'ta bu maliyetler ödenmez.
+
+Ölçümler sanal arayüz (veth) üzerinde, VirtualBox içinde yapılmıştır;
+mutlak değerler değil aynı ortamdaki göreli karşılaştırma anlamlıdır.
 
 ## Hata ayıklama
 
@@ -183,17 +258,29 @@ sudo bpftool map dump name stats         # map'in ham içeriği
 ## Bilinen sınırlar
 
 - Yalnızca IPv4 desteklenir
+- Yalnızca gelen (ingress) trafik işlenir; giden trafik için TC hook gerekir
+- Bağlantı durumu takibi yoktur (stateless); iptables'ın
+  `ESTABLISHED,RELATED` karşılığı bulunmaz
+- Bileşik kuralda kaynak IP tam adres olmalıdır (`/32`); hash map önek
+  eşleşmesi yapamaz, LPM trie de port bilgisi taşıyamaz
+- Port aralığı en fazla 16 tanedir (`MAX_RANGES`), dizi üzerinde döngü
+  derleme zamanında açıldığı için sabit
+- Hız sınırlamada kova güncellemesi tam atomik değildir; yarış durumunda
+  birkaç paket sınırın üzerinde geçebilir
+- `talkers` ve `buckets` map'leri LRU'dur; sayımlar yaklaşıktır, map
+  dolduğunda eski kayıtlar düşer. İzleme için uygun, muhasebe için değil
 - Bir arayüze aynı anda tek XDP programı bağlanabilir (`libxdp` dispatcher
   kullanılmıyor); ikinci yükleme `-EBUSY` verir
 - IP fragmentasyonu dikkate alınmaz
-- `talkers` map'i LRU olduğu için sayımlar yaklaşıktır; map dolduğunda
-  eski kayıtlar düşer. İzleme için uygun, muhasebe için değil
-- Yalnızca gelen (ingress) trafik işlenir; giden trafik için TC hook gerekir
+- Web paneli salt okunurdur ve yalnızca `127.0.0.1`'e bağlanır
 
 ## Yol haritası
 
 - IPv6 desteği
-- IP başına hız sınırlama (token bucket)
-- SYN flood tespiti
-- Web tabanlı izleme paneli
+- TC hook ile giden (egress) trafik kontrolü
+- Bağlantı durumu takibi
+- SYN flood tespiti (TCP bayrak analizi)
+- Kural TTL'i (süreli engelleme)
+- Geolocation tabanlı filtreleme
+- Tehdit istihbaratı beslemesi entegrasyonu
 - `libxdp` ile çoklu program desteği
