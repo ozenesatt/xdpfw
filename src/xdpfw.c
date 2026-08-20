@@ -21,6 +21,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
+#include "banner.h"
 #include "xdpfw.h"
 #include "xdpfw.skel.h"
 
@@ -137,6 +138,7 @@ static int cmd_load(const char *ifname)
 	}
 	close(link_fd);
 
+	banner_bas();
 	printf("XDP programi '%s' arayuzune baglandi.\n", ifname);
 	printf("Kural ekle : sudo ./xdpfw block-ip 10.10.0.2\n");
 	printf("Istatistik : sudo ./xdpfw stats\n");
@@ -714,23 +716,24 @@ static int cmd_list(void)
 
 static void usage(const char *prog)
 {
+	banner_bas();
 	fprintf(stderr,
 "Kullanim: %s <komut> [argumanlar]\n"
 "\n"
-"  load <arayuz>              XDP programini bagla\n"
-"  unload <arayuz>            Programi kaldir\n"
-"  stats [saniye]             Canli istatistik (varsayilan 1 sn)\n"
+"  load / basla <arayuz>      XDP programini bagla\n"
+"  unload / durdur <arayuz>   Programi kaldir\n"
+"  stats / durum [saniye]     Canli istatistik (varsayilan 1 sn)\n"
 "  mode [blacklist|whitelist] Modu goster veya degistir\n"
 "  block-ip <ipv4[/prefix]>   Kaynak IP veya CIDR blogu engelle\n"
 "  allow-ip <ipv4[/prefix]>   Whitelist modunda izin ver (block-ip ile ayni map)\n"
 "  unblock-ip <ipv4[/prefix]> IP/CIDR engelini kaldir\n"
 "  block-port <tcp|udp> <p>   Hedef portu engelle\n"
 "  unblock-port <tcp|udp> <p> Port engelini kaldir\n"
-"  log                        Canli drop olay akisi\n"
+"  log / kayit                Canli drop olay akisi\n"
 "  top [n]                    En cok paket gonderen IP'ler (varsayilan 10)\n"
-"  list                       Kurallari listele\n"
+"  list / kurallar            Kurallari listele\n"
 "  reload <dosya>             Kural dosyasindan yeniden yukle\n"
-"  serve [port]               Web paneli (varsayilan 8080, sadece localhost)\n"
+"  serve / panel [port]       Web paneli (varsayilan 8080, sadece localhost)\n"
 "\n"
 "Ornek:\n"
 "  sudo %s load veth0\n"
@@ -748,36 +751,36 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (!strcmp(argv[1], "load") && argc == 3)
+	if ((!strcmp(argv[1], "load") || !strcmp(argv[1], "basla")) && argc == 3)
 		return cmd_load(argv[2]);
-	if (!strcmp(argv[1], "unload") && argc == 3)
+	if ((!strcmp(argv[1], "unload") || !strcmp(argv[1], "durdur")) && argc == 3)
 		return cmd_unload(argv[2]);
-	if (!strcmp(argv[1], "stats"))
+	if (!strcmp(argv[1], "stats") || !strcmp(argv[1], "durum"))
 		return cmd_stats(argc > 2 ? atoi(argv[2]) : 1);
-	if (!strcmp(argv[1], "mode"))
+	if (!strcmp(argv[1], "mode") || !strcmp(argv[1], "mod"))
 		return cmd_mode(argc > 2 ? argv[2] : NULL);
-	if (!strcmp(argv[1], "allow-ip") && argc == 3)
+	if ((!strcmp(argv[1], "allow-ip") || !strcmp(argv[1], "izin")) && argc == 3)
 		return cmd_ip(argv[2], 1);
-	if (!strcmp(argv[1], "block-ip") && argc == 3)
+	if ((!strcmp(argv[1], "block-ip") || !strcmp(argv[1], "engelle")) && argc == 3)
 		return cmd_ip(argv[2], 1);
-	if (!strcmp(argv[1], "unblock-ip") && argc == 3)
+	if ((!strcmp(argv[1], "unblock-ip") || !strcmp(argv[1], "kaldir")) && argc == 3)
 		return cmd_ip(argv[2], 0);
-	if (!strcmp(argv[1], "block-port") && argc == 4)
+	if ((!strcmp(argv[1], "block-port") || !strcmp(argv[1], "engelle-port")) && argc == 4)
 		return cmd_port(argv[2], argv[3], 1);
-	if (!strcmp(argv[1], "unblock-port") && argc == 4)
+	if ((!strcmp(argv[1], "unblock-port") || !strcmp(argv[1], "kaldir-port")) && argc == 4)
 		return cmd_port(argv[2], argv[3], 0);
-	if (!strcmp(argv[1], "top"))
+	if (!strcmp(argv[1], "top") || !strcmp(argv[1], "zirve"))
 		return cmd_top(argc > 2 ? atoi(argv[2]) : 10);
-	if (!strcmp(argv[1], "log"))
+	if (!strcmp(argv[1], "log") || !strcmp(argv[1], "kayit"))
 		return cmd_log();
-	if (!strcmp(argv[1], "serve")) {
+	if (!strcmp(argv[1], "serve") || !strcmp(argv[1], "panel")) {
 		signal(SIGINT, on_signal);
 		signal(SIGTERM, on_signal);
 		return serve_calistir(argc > 2 ? atoi(argv[2]) : 8080);
 	}
-	if (!strcmp(argv[1], "reload") && argc == 3)
+	if ((!strcmp(argv[1], "reload") || !strcmp(argv[1], "yenile")) && argc == 3)
 		return cmd_reload(argv[2]);
-	if (!strcmp(argv[1], "list"))
+	if (!strcmp(argv[1], "list") || !strcmp(argv[1], "kurallar"))
 		return cmd_list();
 
 	usage(argv[0]);
