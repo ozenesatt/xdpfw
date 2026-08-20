@@ -35,6 +35,18 @@ struct {
 } blocked_ports SEC(".maps");
 
 /*
+ * Bilesik kural: {kaynak IP, protokol, hedef port}
+ * IP tam adres (/32); CIDR desteklenmiyor cunku hash map onek
+ * eslesmesi yapamaz, trie de port bilgisi tasiyamaz.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct flow_key);
+	__type(value, struct rule_stat);
+} blocked_flows SEC(".maps");
+
+/*
  * Calisma modu ve diger ayarlar.
  * ARRAY secildi (rodata degil) cunku calisirken degistirilebilmeli.
  */
@@ -135,6 +147,7 @@ int xdp_fw(struct xdp_md *ctx)
 	struct rule_stat *rs;
 	struct port_key pk;
 	struct lpm_key lk;
+	struct flow_key fk;
 	void *l4;
 	__u32 ihl_bytes, saddr;
 	__u16 dport = 0;
@@ -229,7 +242,24 @@ int xdp_fw(struct xdp_md *ctx)
 		break;
 	}
 
-	/* --- KURAL 2: hedef port blacklist --- */
+	/* --- KURAL 2: bilesik kural (IP + proto + port) --- */
+	if (dport && mod == MODE_BLACKLIST) {
+		__builtin_memset(&fk, 0, sizeof(fk));   /* padding sifirlansin */
+		fk.saddr = saddr;
+		fk.dport = dport;
+		fk.proto = ip->protocol;
+
+		rs = bpf_map_lookup_elem(&blocked_flows, &fk);
+		if (rs) {
+			__sync_fetch_and_add(&rs->hits, 1);
+			bump(STAT_DROPPED);
+			bump(STAT_DROP_FLOW);
+			olay_gonder(saddr, dport, ip->protocol, REASON_FLOW);
+			return XDP_DROP;
+		}
+	}
+
+	/* --- KURAL 3: hedef port blacklist --- */
 	if (dport && mod == MODE_BLACKLIST) {
 		__builtin_memset(&pk, 0, sizeof(pk));
 		pk.port  = dport;

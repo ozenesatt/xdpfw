@@ -57,6 +57,7 @@ static const char *stat_names[STAT_MAX] = {
 	[STAT_DROPPED] = "DROP (toplam)",
 	[STAT_DROP_IP] = "  - IP kurali",
 	[STAT_DROP_PORT] = "  - port kurali",
+	[STAT_DROP_FLOW] = "  - bilesik kural",
 	[STAT_DROP_WL] = "  - izinli degil",
 };
 
@@ -109,6 +110,7 @@ static int cmd_load(const char *ifname)
 	bpf_map__set_pin_path(skel->maps.stats, PIN_DIR "/stats");
 	bpf_map__set_pin_path(skel->maps.blocked_ips, PIN_DIR "/blocked_ips");
 	bpf_map__set_pin_path(skel->maps.blocked_ports, PIN_DIR "/blocked_ports");
+	bpf_map__set_pin_path(skel->maps.blocked_flows, PIN_DIR "/blocked_flows");
 	bpf_map__set_pin_path(skel->maps.events, PIN_DIR "/events");
 	bpf_map__set_pin_path(skel->maps.talkers, PIN_DIR "/talkers");
 	bpf_map__set_pin_path(skel->maps.fw_config, PIN_DIR "/fw_config");
@@ -395,6 +397,61 @@ static int cmd_log(void)
 
 
 
+
+
+/* ----------------------------------------------------------------- flow */
+
+/* "10.0.0.5 tcp 22" -> bilesik kural */
+static int cmd_flow(const char *ipstr, const char *proto_s,
+		    const char *port_s, int ekle)
+{
+	struct rule_stat val = {};
+	struct flow_key key;
+	struct in_addr addr;
+	int fd, err, port;
+	__u8 proto;
+
+	if (inet_pton(AF_INET, ipstr, &addr) != 1) {
+		fprintf(stderr, "Gecersiz IPv4 adresi: %s\n", ipstr);
+		return 1;
+	}
+	if (!strcmp(proto_s, "tcp"))
+		proto = IPPROTO_TCP;
+	else if (!strcmp(proto_s, "udp"))
+		proto = IPPROTO_UDP;
+	else {
+		fprintf(stderr, "Protokol 'tcp' veya 'udp' olmali.\n");
+		return 1;
+	}
+	port = atoi(port_s);
+	if (port < 1 || port > 65535) {
+		fprintf(stderr, "Gecersiz port: %s\n", port_s);
+		return 1;
+	}
+
+	fd = open_pinned("blocked_flows");
+	if (fd < 0)
+		return 1;
+
+	memset(&key, 0, sizeof(key));   /* padding sifirlansin */
+	key.saddr = addr.s_addr;
+	key.dport = htons((__u16)port);
+	key.proto = proto;
+
+	if (ekle)
+		err = bpf_map_update_elem(fd, &key, &val, BPF_ANY);
+	else
+		err = bpf_map_delete_elem(fd, &key);
+
+	if (err)
+		fprintf(stderr, "Islem basarisiz: %s\n", strerror(errno));
+	else
+		printf("%s -> %s/%d %s\n", ipstr, proto_s, port,
+		       ekle ? "engellendi." : "engeli kaldirildi.");
+
+	close(fd);
+	return err ? 1 : 0;
+}
 
 /* ----------------------------------------------------------------- mode */
 
@@ -689,6 +746,29 @@ static int cmd_list(void)
 		return 1;
 
 	bos = 1;
+	printf("\nEngellenen akislar (IP -> port):\n");
+	fd = open_pinned("blocked_flows");
+	if (fd >= 0) {
+		struct flow_key key, next_key, *pk = NULL;
+
+		while (bpf_map_get_next_key(fd, pk, &next_key) == 0) {
+			key = next_key;
+			if (bpf_map_lookup_elem(fd, &key, &val) == 0) {
+				inet_ntop(AF_INET, &key.saddr, buf, sizeof(buf));
+				printf("  %-15s -> %s/%-5u eslesme=%llu\n", buf,
+				       key.proto == IPPROTO_TCP ? "tcp" : "udp",
+				       ntohs(key.dport),
+				       (unsigned long long)val.hits);
+				bos = 0;
+			}
+			pk = &key;
+		}
+		close(fd);
+	}
+	if (bos)
+		printf("  (yok)\n");
+
+	bos = 1;
 	printf("\nEngellenen portlar:\n");
 	{
 		struct port_key key, next_key, *pk = NULL;
@@ -727,6 +807,8 @@ static void usage(const char *prog)
 "  block-ip / engelle <ip>    Kaynak IP veya CIDR blogu engelle\n"
 "  allow-ip / izin <ip>       Whitelist modunda izin ver\n"
 "  unblock-ip / kaldir <ip>   IP/CIDR engelini kaldir\n"
+"  block-flow / engelle-akis  <ip> <tcp|udp> <port>\n"
+"  unblock-flow / kaldir-akis <ip> <tcp|udp> <port>\n"
 "  block-port / engelle-port  <tcp|udp> <port>\n"
 "  unblock-port / kaldir-port <tcp|udp> <port>\n"
 "  log / kayit                Canli drop olay akisi\n"
@@ -765,6 +847,10 @@ int main(int argc, char **argv)
 		return cmd_ip(argv[2], 1);
 	if ((!strcmp(argv[1], "unblock-ip") || !strcmp(argv[1], "kaldir")) && argc == 3)
 		return cmd_ip(argv[2], 0);
+	if ((!strcmp(argv[1], "block-flow") || !strcmp(argv[1], "engelle-akis")) && argc == 5)
+		return cmd_flow(argv[2], argv[3], argv[4], 1);
+	if ((!strcmp(argv[1], "unblock-flow") || !strcmp(argv[1], "kaldir-akis")) && argc == 5)
+		return cmd_flow(argv[2], argv[3], argv[4], 0);
 	if ((!strcmp(argv[1], "block-port") || !strcmp(argv[1], "engelle-port")) && argc == 4)
 		return cmd_port(argv[2], argv[3], 1);
 	if ((!strcmp(argv[1], "unblock-port") || !strcmp(argv[1], "kaldir-port")) && argc == 4)

@@ -16,6 +16,7 @@ enum stat_idx {
 	STAT_DROPPED,
 	STAT_DROP_IP,     /* IP kurali dusurdu */
 	STAT_DROP_PORT,   /* port kurali dusurdu */
+	STAT_DROP_FLOW,   /* bilesik kural dusurdu */
 	STAT_DROP_WL,     /* whitelist: izinli degil */
 	STAT_MAX,
 };
@@ -37,6 +38,7 @@ enum cfg_idx {
 enum drop_reason {
 	REASON_IP = 0,
 	REASON_PORT,
+	REASON_FLOW,          /* bilesik kural */
 	REASON_NOT_ALLOWED,   /* whitelist: izinli listede yok */
 };
 
@@ -57,6 +59,21 @@ struct lpm_key {
 
 struct rule_stat {
 	__u64 hits;
+};
+
+
+/*
+ * Bilesik kural anahtari: kaynak IP + protokol + hedef port.
+ *
+ * Padding yine kritik - bayt bayt karsilastirma yapiliyor.
+ * IP burada TAM ADRES (/32); CIDR desteklenmiyor cunku hash map
+ * onek eslesmesi yapamaz, trie de port bilgisi tasiyamaz.
+ */
+struct flow_key {
+	__u32 saddr;   /* network byte order */
+	__u16 dport;   /* network byte order */
+	__u8  proto;
+	__u8  pad;     /* her zaman 0 */
 };
 
 /*

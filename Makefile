@@ -36,7 +36,7 @@ clean:
 distclean: clean
 	rm -f $(SRC)/vmlinux.h
 
-PREFIX ?= /usr/local
+PREFIX ?= /usr
 
 .PHONY: install uninstall
 install: $(APP)
