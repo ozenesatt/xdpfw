@@ -1,0 +1,28 @@
+[Unit]
+Description=xdpfw - XDP tabanli ag trafik izleyici ve firewall
+Documentation=https://github.com/ozenesatt/xdpfw
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=simple
+Environment=XDPFW_IF=eth0
+EnvironmentFile=-/etc/xdpfw/xdpfw.env
+ExecStart=/usr/sbin/xdpfw daemon ${XDPFW_IF} /etc/xdpfw/rules.conf
+ExecStopPost=/usr/sbin/xdpfw durdur ${XDPFW_IF}
+Restart=on-failure
+RestartSec=5
+
+# BPF icin gerekli yetkiler
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
+
+# Guvenlik sikilastirmasi
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/xdpfw /sys/fs/bpf
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

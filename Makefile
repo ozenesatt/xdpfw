@@ -42,6 +42,13 @@ PREFIX ?= /usr
 install: $(APP)
 	install -D -m755 $(APP) $(DESTDIR)$(PREFIX)/sbin/$(APP)
 	install -D -m644 rules.conf $(DESTDIR)/etc/xdpfw/rules.conf
+	install -D -m644 xdpfw.env $(DESTDIR)/etc/xdpfw/xdpfw.env
+	install -D -m644 xdpfw.service $(DESTDIR)/lib/systemd/system/xdpfw.service
+	install -D -m644 xdpfw.logrotate $(DESTDIR)/etc/logrotate.d/xdpfw
+	install -d -m750 $(DESTDIR)/var/log/xdpfw
+	@echo "Servisi etkinlestirmek icin:"
+	@echo "  sudo systemctl daemon-reload"
+	@echo "  sudo systemctl enable --now xdpfw"
 	@echo "Kuruldu. Artik her yerden: sudo xdpfw basla <arayuz>"
 
 uninstall:

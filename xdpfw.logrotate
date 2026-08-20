@@ -1,0 +1,8 @@
+/var/log/xdpfw/*.jsonl {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <bpf/bpf.h>
@@ -81,7 +82,23 @@ static int open_pinned(const char *name)
 
 /* ---------------------------------------------------------------- load */
 
+static int cmd_load_sessiz(const char *ifname);
+static int cmd_reload(const char *dosya);
+
 static int cmd_load(const char *ifname)
+{
+	int r = cmd_load_sessiz(ifname);
+
+	if (r == 0) {
+		banner_bas();
+		printf("XDP programi '%s' arayuzune baglandi.\n", ifname);
+		printf("Kural ekle : sudo xdpfw engelle <ip>\n");
+		printf("Istatistik : sudo xdpfw durum\n");
+	}
+	return r;
+}
+
+static int cmd_load_sessiz(const char *ifname)
 {
 	struct xdpfw_bpf *skel;
 	char path[256];
@@ -144,10 +161,6 @@ static int cmd_load(const char *ifname)
 	}
 	close(link_fd);
 
-	banner_bas();
-	printf("XDP programi '%s' arayuzune baglandi.\n", ifname);
-	printf("Kural ekle : sudo ./xdpfw block-ip 10.10.0.2\n");
-	printf("Istatistik : sudo ./xdpfw stats\n");
 	err = 0;
 out:
 	xdpfw_bpf__destroy(skel);
@@ -570,6 +583,137 @@ static int cmd_range(const char *proto_s, const char *bas_s,
 	return 0;
 }
 
+
+/* --------------------------------------------------------------- daemon */
+
+#define LOG_DIZIN "/var/log/xdpfw"
+#define LOG_DOSYA LOG_DIZIN "/events.jsonl"
+#define LOG_MAX   (10 * 1024 * 1024)   /* 10 MB -> dondur */
+
+static FILE *log_fp;
+
+static const char *proto_adi_us(__u8 p)
+{
+	switch (p) {
+	case IPPROTO_TCP:  return "tcp";
+	case IPPROTO_UDP:  return "udp";
+	case IPPROTO_ICMP: return "icmp";
+	default:           return "other";
+	}
+}
+
+static const char *sebep_adi_us(__u8 r)
+{
+	switch (r) {
+	case REASON_IP:          return "ip";
+	case REASON_DST:         return "dst";
+	case REASON_RANGE:       return "range";
+	case REASON_FLOW:        return "flow";
+	case REASON_PORT:        return "port";
+	case REASON_NOT_ALLOWED: return "not_allowed";
+	default:                 return "unknown";
+	}
+}
+
+/* Dosya buyuduyse .1 uzantisiyla dondur */
+static void log_dondur(void)
+{
+	char eski[256];
+	long boyut;
+
+	if (!log_fp)
+		return;
+	boyut = ftell(log_fp);
+	if (boyut < LOG_MAX)
+		return;
+
+	fclose(log_fp);
+	snprintf(eski, sizeof(eski), LOG_DOSYA ".1");
+	rename(LOG_DOSYA, eski);
+	log_fp = fopen(LOG_DOSYA, "a");
+}
+
+/*
+ * JSON Lines formati: her satir bagimsiz bir JSON nesnesi.
+ * jq ile islenebilir, SIEM'e beslenebilir, satir satir okunabilir.
+ */
+static int log_yaz(void *ctx, void *data, size_t len)
+{
+	const struct drop_event *e = data;
+	char ip[INET_ADDRSTRLEN];
+	time_t simdi;
+
+	(void)ctx;
+	if (len < sizeof(*e) || !log_fp)
+		return 0;
+
+	inet_ntop(AF_INET, &e->saddr, ip, sizeof(ip));
+	simdi = time(NULL);
+
+	fprintf(log_fp,
+		"{\"time\":%ld,\"uptime_ns\":%llu,\"src\":\"%s\","
+		"\"dport\":%u,\"proto\":\"%s\",\"reason\":\"%s\"}\n",
+		(long)simdi, (unsigned long long)e->ts, ip,
+		ntohs(e->dport), proto_adi_us(e->proto), sebep_adi_us(e->reason));
+
+	fflush(log_fp);
+	log_dondur();
+	return 0;
+}
+
+static int cmd_daemon(const char *ifname, const char *kural_dosyasi)
+{
+	struct ring_buffer *rb;
+	int rb_fd, err;
+
+	/* Once XDP'yi bagla (banner basmadan) */
+	err = cmd_load_sessiz(ifname);
+	if (err)
+		return err;
+
+	if (kural_dosyasi && cmd_reload(kural_dosyasi))
+		fprintf(stderr, "Uyari: kural dosyasi yuklenemedi\n");
+
+	mkdir(LOG_DIZIN, 0750);
+	log_fp = fopen(LOG_DOSYA, "a");
+	if (!log_fp)
+		fprintf(stderr, "Uyari: %s acilamadi (%s), log yazilmayacak\n",
+			LOG_DOSYA, strerror(errno));
+
+	rb_fd = open_pinned("events");
+	if (rb_fd < 0)
+		return 1;
+
+	rb = ring_buffer__new(rb_fd, log_yaz, NULL, NULL);
+	if (!rb) {
+		close(rb_fd);
+		return 1;
+	}
+
+	printf("xdpfw servisi calisiyor (arayuz: %s)\n", ifname);
+	printf("Log: %s\n", LOG_DOSYA);
+	fflush(stdout);
+
+	signal(SIGINT, on_signal);
+	signal(SIGTERM, on_signal);
+
+	while (!stop) {
+		int n = ring_buffer__poll(rb, 500);
+
+		if (n < 0 && n != -EINTR)
+			break;
+	}
+
+	printf("Kapaniyor...\n");
+	ring_buffer__free(rb);
+	close(rb_fd);
+	if (log_fp)
+		fclose(log_fp);
+
+	/* XDP bagli kalir - unload ile ayrilir */
+	return 0;
+}
+
 /* ----------------------------------------------------------------- mode */
 
 static __u32 mod_oku_us(void)
@@ -982,6 +1126,7 @@ static void usage(const char *prog)
 "  list / kurallar            Kurallari listele\n"
 "  reload / yenile <dosya>    Kural dosyasindan yeniden yukle\n"
 "  serve / panel [port]       Web paneli (varsayilan 8080, sadece localhost)\n"
+"  daemon <arayuz> [kural]    Servis modu: bagla, dinle, log yaz\n"
 "\n"
 "Ornek:\n"
 "  sudo %s basla veth0\n"
@@ -1038,6 +1183,8 @@ int main(int argc, char **argv)
 		signal(SIGTERM, on_signal);
 		return serve_calistir(argc > 2 ? atoi(argv[2]) : 8080);
 	}
+	if (!strcmp(argv[1], "daemon") && argc >= 3)
+		return cmd_daemon(argv[2], argc > 3 ? argv[3] : NULL);
 	if ((!strcmp(argv[1], "reload") || !strcmp(argv[1], "yenile")) && argc == 3)
 		return cmd_reload(argv[2]);
 	if (!strcmp(argv[1], "list") || !strcmp(argv[1], "kurallar"))
