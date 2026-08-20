@@ -16,6 +16,7 @@ enum stat_idx {
 	STAT_DROPPED,
 	STAT_DROP_IP,     /* IP kurali dusurdu */
 	STAT_DROP_PORT,   /* port kurali dusurdu */
+	STAT_DROP_RATE,   /* hiz siniri dusurdu */
 	STAT_DROP_DST,    /* hedef IP kurali dusurdu */
 	STAT_DROP_RANGE,  /* port araligi dusurdu */
 	STAT_DROP_FLOW,   /* bilesik kural dusurdu */
@@ -40,6 +41,7 @@ enum cfg_idx {
 enum drop_reason {
 	REASON_IP = 0,
 	REASON_PORT,
+	REASON_RATE,          /* hiz siniri asildi */
 	REASON_DST,           /* hedef IP kurali */
 	REASON_RANGE,         /* port araligi */
 	REASON_FLOW,          /* bilesik kural */
@@ -66,6 +68,29 @@ struct rule_stat {
 };
 
 
+
+
+/*
+ * Token bucket (jeton kovasi) — IP basina hiz sinirlama.
+ *
+ * Jetonlar OLCEKLENMIS tam sayi olarak tutuluyor (1 jeton = 1000 birim),
+ * cunku BPF'te kayan nokta yok. Bolme de pahali oldugu icin dolum
+ * hesabinda carpma kullaniliyor.
+ */
+#define TOKEN_OLCEK 1000ULL
+
+struct token_kova {
+	__u64 jeton;      /* mevcut jeton (olceklenmis) */
+	__u64 son_ns;     /* son guncelleme zamani */
+	__u64 gecen;      /* izin verilen paket */
+	__u64 dusen;      /* sinira takilan paket */
+};
+
+/* Limit tanimi: LPM trie'de tutuluyor, CIDR destekli */
+struct limit_val {
+	__u32 hiz;        /* saniyede kac paket */
+	__u32 kapasite;   /* kovanin maksimum jeton sayisi (burst) */
+};
 
 /* Port araligi kurali. Dizi uzerinde donguyle taranir. */
 #define MAX_RANGES 16

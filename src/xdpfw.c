@@ -58,6 +58,7 @@ static const char *stat_names[STAT_MAX] = {
 	[STAT_DROPPED] = "DROP (toplam)",
 	[STAT_DROP_IP] = "  - IP kurali",
 	[STAT_DROP_PORT] = "  - port kurali",
+	[STAT_DROP_RATE] = "  - hiz siniri",
 	[STAT_DROP_DST] = "  - hedef IP",
 	[STAT_DROP_RANGE] = "  - port araligi",
 	[STAT_DROP_FLOW] = "  - bilesik kural",
@@ -132,6 +133,8 @@ static int cmd_load_sessiz(const char *ifname)
 	bpf_map__set_pin_path(skel->maps.blocked_flows, PIN_DIR "/blocked_flows");
 	bpf_map__set_pin_path(skel->maps.blocked_dsts, PIN_DIR "/blocked_dsts");
 	bpf_map__set_pin_path(skel->maps.port_ranges, PIN_DIR "/port_ranges");
+	bpf_map__set_pin_path(skel->maps.rate_limits, PIN_DIR "/rate_limits");
+	bpf_map__set_pin_path(skel->maps.buckets, PIN_DIR "/buckets");
 	bpf_map__set_pin_path(skel->maps.events, PIN_DIR "/events");
 	bpf_map__set_pin_path(skel->maps.talkers, PIN_DIR "/talkers");
 	bpf_map__set_pin_path(skel->maps.fw_config, PIN_DIR "/fw_config");
@@ -584,6 +587,71 @@ static int cmd_range(const char *proto_s, const char *bas_s,
 }
 
 
+
+/* ------------------------------------------------------------ hiz siniri */
+
+/* "10.0.0.0/8 1000 [burst]" -> hiz siniri kurali */
+static int cmd_rate(const char *spec, const char *hiz_s,
+		    const char *burst_s, int ekle)
+{
+	struct limit_val val = {};
+	struct lpm_key key;
+	struct in_addr addr;
+	char ipstr[64], *egik;
+	int fd, err, prefixlen = 32, hiz, burst;
+
+	snprintf(ipstr, sizeof(ipstr), "%s", spec);
+	egik = strchr(ipstr, '/');
+	if (egik) {
+		*egik = '\0';
+		prefixlen = atoi(egik + 1);
+		if (prefixlen < 0 || prefixlen > 32) {
+			fprintf(stderr, "Gecersiz prefix: %s\n", spec);
+			return 1;
+		}
+	}
+	if (inet_pton(AF_INET, ipstr, &addr) != 1) {
+		fprintf(stderr, "Gecersiz IPv4 adresi: %s\n", ipstr);
+		return 1;
+	}
+
+	if (ekle) {
+		hiz = atoi(hiz_s);
+		if (hiz < 1) {
+			fprintf(stderr, "Hiz en az 1 olmali (paket/saniye).\n");
+			return 1;
+		}
+		/* Burst verilmezse hizin 2 kati - kisa patlamalara izin */
+		burst = burst_s ? atoi(burst_s) : hiz * 2;
+		if (burst < hiz)
+			burst = hiz;
+		val.hiz = (__u32)hiz;
+		val.kapasite = (__u32)burst;
+	}
+
+	fd = open_pinned("rate_limits");
+	if (fd < 0)
+		return 1;
+
+	memset(&key, 0, sizeof(key));
+	key.prefixlen = (__u32)prefixlen;
+	memcpy(key.data, &addr.s_addr, 4);
+
+	err = ekle ? bpf_map_update_elem(fd, &key, &val, BPF_ANY)
+		   : bpf_map_delete_elem(fd, &key);
+
+	if (err)
+		fprintf(stderr, "Islem basarisiz: %s\n", strerror(errno));
+	else if (ekle)
+		printf("%s/%d icin hiz siniri: %d paket/sn (burst %d)\n",
+		       ipstr, prefixlen, val.hiz, val.kapasite);
+	else
+		printf("%s/%d hiz siniri kaldirildi.\n", ipstr, prefixlen);
+
+	close(fd);
+	return err ? 1 : 0;
+}
+
 /* --------------------------------------------------------------- daemon */
 
 #define LOG_DIZIN "/var/log/xdpfw"
@@ -1007,6 +1075,42 @@ static int cmd_list(void)
 		return 1;
 
 	bos = 1;
+	printf("\nHiz sinirlari:\n");
+	fd = open_pinned("rate_limits");
+	if (fd >= 0) {
+		struct lpm_key key, next_key, *pk = NULL;
+		struct limit_val lv;
+		char g[32];
+		int kfd;
+
+		kfd = open_pinned("buckets");
+		while (bpf_map_get_next_key(fd, pk, &next_key) == 0) {
+			key = next_key;
+			if (bpf_map_lookup_elem(fd, &key, &lv) == 0) {
+				struct token_kova kv = {};
+				__u32 ip4;
+
+				inet_ntop(AF_INET, key.data, buf, sizeof(buf));
+				snprintf(g, sizeof(g), "%s/%u", buf, key.prefixlen);
+				memcpy(&ip4, key.data, 4);
+				if (kfd >= 0)
+					bpf_map_lookup_elem(kfd, &ip4, &kv);
+				printf("  %-18s %u pkt/sn (burst %u)  gecen=%llu dusen=%llu\n",
+				       g, lv.hiz, lv.kapasite,
+				       (unsigned long long)kv.gecen,
+				       (unsigned long long)kv.dusen);
+				bos = 0;
+			}
+			pk = &key;
+		}
+		if (kfd >= 0)
+			close(kfd);
+		close(fd);
+	}
+	if (bos)
+		printf("  (yok)\n");
+
+	bos = 1;
 	printf("\nEngellenen hedef IP'ler:\n");
 	fd = open_pinned("blocked_dsts");
 	if (fd >= 0) {
@@ -1113,6 +1217,8 @@ static void usage(const char *prog)
 "  block-ip / engelle <ip>    Kaynak IP veya CIDR blogu engelle\n"
 "  allow-ip / izin <ip>       Whitelist modunda izin ver\n"
 "  unblock-ip / kaldir <ip>   IP/CIDR engelini kaldir\n"
+"  rate-limit / hiz-sinir <ip[/prefix]> <pkt/sn> [burst]\n"
+"  unrate-limit / sinir-kaldir <ip[/prefix]>\n"
 "  block-dst / engelle-hedef  <ip[/prefix]>  Hedef IP engelle\n"
 "  unblock-dst / kaldir-hedef <ip[/prefix]>\n"
 "  block-range / engelle-aralik <tcp|udp> <bas> <son>\n"
@@ -1158,6 +1264,10 @@ int main(int argc, char **argv)
 		return cmd_ip(argv[2], 1);
 	if ((!strcmp(argv[1], "unblock-ip") || !strcmp(argv[1], "kaldir")) && argc == 3)
 		return cmd_ip(argv[2], 0);
+	if ((!strcmp(argv[1], "rate-limit") || !strcmp(argv[1], "hiz-sinir")) && argc >= 4)
+		return cmd_rate(argv[2], argv[3], argc > 4 ? argv[4] : NULL, 1);
+	if ((!strcmp(argv[1], "unrate-limit") || !strcmp(argv[1], "sinir-kaldir")) && argc == 3)
+		return cmd_rate(argv[2], NULL, NULL, 0);
 	if ((!strcmp(argv[1], "block-dst") || !strcmp(argv[1], "engelle-hedef")) && argc == 3)
 		return cmd_dst(argv[2], 1);
 	if ((!strcmp(argv[1], "unblock-dst") || !strcmp(argv[1], "kaldir-hedef")) && argc == 3)

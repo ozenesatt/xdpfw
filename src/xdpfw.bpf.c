@@ -61,6 +61,23 @@ struct {
 	__type(value, struct port_range);
 } port_ranges SEC(".maps");
 
+/* Hiz siniri tanimlari (CIDR destekli) */
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 256);
+	__type(key, struct lpm_key);
+	__type(value, struct limit_val);
+} rate_limits SEC(".maps");
+
+/* IP basina kova durumu. LRU: kac farkli IP gelecegi bilinmiyor. */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u32);
+	__type(value, struct token_kova);
+} buckets SEC(".maps");
+
 /*
  * Calisma modu ve diger ayarlar.
  * ARRAY secildi (rodata degil) cunku calisirken degistirilebilmeli.
@@ -152,6 +169,61 @@ static __always_inline __u32 mod_oku(void)
 	return v ? *v : MODE_BLACKLIST;
 }
 
+
+/*
+ * Jeton kovasi kontrolu.
+ * Donus: 1 = paket gecebilir, 0 = sinir asildi
+ */
+static __always_inline int kova_kontrol(__u32 saddr, struct limit_val *lv)
+{
+	struct token_kova *b, yeni;
+	__u64 simdi = bpf_ktime_get_ns();
+	__u64 tavan = (__u64)lv->kapasite * TOKEN_OLCEK;
+
+	b = bpf_map_lookup_elem(&buckets, &saddr);
+	if (!b) {
+		/* Ilk paket: kovayi dolu baslat, bir jeton harca */
+		__builtin_memset(&yeni, 0, sizeof(yeni));
+		yeni.jeton = tavan - TOKEN_OLCEK;
+		yeni.son_ns = simdi;
+		yeni.gecen = 1;
+		bpf_map_update_elem(&buckets, &saddr, &yeni, BPF_ANY);
+		return 1;
+	}
+
+	/*
+	 * Gecen sureye gore jeton ekle.
+	 * jeton += (gecen_ns * hiz * OLCEK) / 1e9
+	 * Bolmeyi 1e9 ile yapmak zorundayiz ama once carpip
+	 * tasmayi onlemek icin gecen sureyi sinirliyoruz.
+	 */
+	{
+		__u64 fark = simdi - b->son_ns;
+		__u64 eklenen;
+
+		if (fark > 1000000000ULL)
+			fark = 1000000000ULL;   /* en fazla 1 saniyelik dolum */
+
+		eklenen = (fark * (__u64)lv->hiz * TOKEN_OLCEK) / 1000000000ULL;
+
+		if (eklenen > 0) {
+			b->jeton += eklenen;
+			if (b->jeton > tavan)
+				b->jeton = tavan;
+			b->son_ns = simdi;
+		}
+	}
+
+	if (b->jeton >= TOKEN_OLCEK) {
+		b->jeton -= TOKEN_OLCEK;
+		__sync_fetch_and_add(&b->gecen, 1);
+		return 1;
+	}
+
+	__sync_fetch_and_add(&b->dusen, 1);
+	return 0;
+}
+
 SEC("xdp")
 int xdp_fw(struct xdp_md *ctx)
 {
@@ -166,6 +238,7 @@ int xdp_fw(struct xdp_md *ctx)
 	__u32 daddr;
 	__u16 dport_h;
 	int i;
+	struct limit_val *lv;
 	void *l4;
 	__u32 ihl_bytes, saddr;
 	__u16 dport = 0;
@@ -230,6 +303,21 @@ int xdp_fw(struct xdp_md *ctx)
 		bump(STAT_DROP_IP);
 		olay_gonder(saddr, 0, ip->protocol, REASON_IP);
 		return XDP_DROP;
+	}
+
+	/* --- KURAL 1a: hiz siniri (token bucket) --- */
+	if (mod == MODE_BLACKLIST) {
+		__builtin_memset(&lk, 0, sizeof(lk));
+		lk.prefixlen = 32;
+		__builtin_memcpy(lk.data, &saddr, 4);
+
+		lv = bpf_map_lookup_elem(&rate_limits, &lk);
+		if (lv && lv->hiz > 0 && !kova_kontrol(saddr, lv)) {
+			bump(STAT_DROPPED);
+			bump(STAT_DROP_RATE);
+			olay_gonder(saddr, 0, ip->protocol, REASON_RATE);
+			return XDP_DROP;
+		}
 	}
 
 	/* --- KURAL 1b: hedef IP blacklist --- */
