@@ -57,6 +57,8 @@ static const char *stat_names[STAT_MAX] = {
 	[STAT_DROPPED] = "DROP (toplam)",
 	[STAT_DROP_IP] = "  - IP kurali",
 	[STAT_DROP_PORT] = "  - port kurali",
+	[STAT_DROP_DST] = "  - hedef IP",
+	[STAT_DROP_RANGE] = "  - port araligi",
 	[STAT_DROP_FLOW] = "  - bilesik kural",
 	[STAT_DROP_WL] = "  - izinli degil",
 };
@@ -111,6 +113,8 @@ static int cmd_load(const char *ifname)
 	bpf_map__set_pin_path(skel->maps.blocked_ips, PIN_DIR "/blocked_ips");
 	bpf_map__set_pin_path(skel->maps.blocked_ports, PIN_DIR "/blocked_ports");
 	bpf_map__set_pin_path(skel->maps.blocked_flows, PIN_DIR "/blocked_flows");
+	bpf_map__set_pin_path(skel->maps.blocked_dsts, PIN_DIR "/blocked_dsts");
+	bpf_map__set_pin_path(skel->maps.port_ranges, PIN_DIR "/port_ranges");
 	bpf_map__set_pin_path(skel->maps.events, PIN_DIR "/events");
 	bpf_map__set_pin_path(skel->maps.talkers, PIN_DIR "/talkers");
 	bpf_map__set_pin_path(skel->maps.fw_config, PIN_DIR "/fw_config");
@@ -453,6 +457,119 @@ static int cmd_flow(const char *ipstr, const char *proto_s,
 	return err ? 1 : 0;
 }
 
+
+/* ------------------------------------------------------- hedef IP / aralik */
+
+/* Hedef IP kurali (CIDR destekli) */
+static int cmd_dst(const char *spec, int ekle)
+{
+	struct rule_stat val = {};
+	struct lpm_key key;
+	struct in_addr addr;
+	char ipstr[64], *egik;
+	int fd, err, prefixlen = 32;
+
+	snprintf(ipstr, sizeof(ipstr), "%s", spec);
+	egik = strchr(ipstr, '/');
+	if (egik) {
+		*egik = '\0';
+		prefixlen = atoi(egik + 1);
+		if (prefixlen < 0 || prefixlen > 32) {
+			fprintf(stderr, "Gecersiz prefix: %s\n", spec);
+			return 1;
+		}
+	}
+	if (inet_pton(AF_INET, ipstr, &addr) != 1) {
+		fprintf(stderr, "Gecersiz IPv4 adresi: %s\n", ipstr);
+		return 1;
+	}
+
+	fd = open_pinned("blocked_dsts");
+	if (fd < 0)
+		return 1;
+
+	memset(&key, 0, sizeof(key));
+	key.prefixlen = (__u32)prefixlen;
+	memcpy(key.data, &addr.s_addr, 4);
+
+	err = ekle ? bpf_map_update_elem(fd, &key, &val, BPF_ANY)
+		   : bpf_map_delete_elem(fd, &key);
+
+	if (err)
+		fprintf(stderr, "Islem basarisiz: %s\n", strerror(errno));
+	else
+		printf("hedef %s/%d %s\n", ipstr, prefixlen,
+		       ekle ? "engellendi." : "engeli kaldirildi.");
+
+	close(fd);
+	return err ? 1 : 0;
+}
+
+/* Port araligi: dizide bos slot bul ve yaz */
+static int cmd_range(const char *proto_s, const char *bas_s,
+		     const char *son_s, int ekle)
+{
+	struct port_range pr, bos = {};
+	int fd, bas, son, i, hedef = -1;
+	__u8 proto;
+	__u32 k;
+
+	if (!strcmp(proto_s, "tcp"))
+		proto = IPPROTO_TCP;
+	else if (!strcmp(proto_s, "udp"))
+		proto = IPPROTO_UDP;
+	else {
+		fprintf(stderr, "Protokol 'tcp' veya 'udp' olmali.\n");
+		return 1;
+	}
+
+	bas = atoi(bas_s);
+	son = atoi(son_s);
+	if (bas < 1 || son > 65535 || bas > son) {
+		fprintf(stderr, "Gecersiz aralik: %s-%s\n", bas_s, son_s);
+		return 1;
+	}
+
+	fd = open_pinned("port_ranges");
+	if (fd < 0)
+		return 1;
+
+	/* Once mevcut ayni kurali ara, yoksa bos slot bul */
+	for (i = 0; i < MAX_RANGES; i++) {
+		k = i;
+		if (bpf_map_lookup_elem(fd, &k, &pr))
+			continue;
+		if (pr.proto == proto && pr.bas == bas && pr.son == son) {
+			hedef = i;
+			break;
+		}
+		if (pr.proto == 0 && hedef < 0)
+			hedef = i;
+	}
+
+	if (hedef < 0) {
+		fprintf(stderr, "Aralik tablosu dolu (max %d).\n", MAX_RANGES);
+		close(fd);
+		return 1;
+	}
+
+	k = hedef;
+	if (ekle) {
+		memset(&pr, 0, sizeof(pr));
+		pr.bas = (__u16)bas;
+		pr.son = (__u16)son;
+		pr.proto = proto;
+		bpf_map_update_elem(fd, &k, &pr, BPF_ANY);
+		printf("%s/%d-%d engellendi.\n", proto_s, bas, son);
+	} else {
+		bpf_map_update_elem(fd, &k, &bos, BPF_ANY);
+		printf("%s/%d-%d engeli kaldirildi.\n", proto_s, bas, son);
+	}
+
+	close(fd);
+	return 0;
+}
+
 /* ----------------------------------------------------------------- mode */
 
 static __u32 mod_oku_us(void)
@@ -746,6 +863,51 @@ static int cmd_list(void)
 		return 1;
 
 	bos = 1;
+	printf("\nEngellenen hedef IP'ler:\n");
+	fd = open_pinned("blocked_dsts");
+	if (fd >= 0) {
+		struct lpm_key key, next_key, *pk = NULL;
+		char g[32];
+
+		while (bpf_map_get_next_key(fd, pk, &next_key) == 0) {
+			key = next_key;
+			if (bpf_map_lookup_elem(fd, &key, &val) == 0) {
+				inet_ntop(AF_INET, key.data, buf, sizeof(buf));
+				snprintf(g, sizeof(g), "%s/%u", buf, key.prefixlen);
+				printf("  %-18s eslesme=%llu\n", g,
+				       (unsigned long long)val.hits);
+				bos = 0;
+			}
+			pk = &key;
+		}
+		close(fd);
+	}
+	if (bos)
+		printf("  (yok)\n");
+
+	bos = 1;
+	printf("\nPort araliklari:\n");
+	fd = open_pinned("port_ranges");
+	if (fd >= 0) {
+		struct port_range pr;
+		__u32 k;
+		int i;
+
+		for (i = 0; i < MAX_RANGES; i++) {
+			k = i;
+			if (bpf_map_lookup_elem(fd, &k, &pr) || pr.proto == 0)
+				continue;
+			printf("  %-4s/%u-%-5u eslesme=%llu\n",
+			       pr.proto == IPPROTO_TCP ? "tcp" : "udp",
+			       pr.bas, pr.son, (unsigned long long)pr.hits);
+			bos = 0;
+		}
+		close(fd);
+	}
+	if (bos)
+		printf("  (yok)\n");
+
+	bos = 1;
 	printf("\nEngellenen akislar (IP -> port):\n");
 	fd = open_pinned("blocked_flows");
 	if (fd >= 0) {
@@ -807,6 +969,10 @@ static void usage(const char *prog)
 "  block-ip / engelle <ip>    Kaynak IP veya CIDR blogu engelle\n"
 "  allow-ip / izin <ip>       Whitelist modunda izin ver\n"
 "  unblock-ip / kaldir <ip>   IP/CIDR engelini kaldir\n"
+"  block-dst / engelle-hedef  <ip[/prefix]>  Hedef IP engelle\n"
+"  unblock-dst / kaldir-hedef <ip[/prefix]>\n"
+"  block-range / engelle-aralik <tcp|udp> <bas> <son>\n"
+"  unblock-range / kaldir-aralik <tcp|udp> <bas> <son>\n"
 "  block-flow / engelle-akis  <ip> <tcp|udp> <port>\n"
 "  unblock-flow / kaldir-akis <ip> <tcp|udp> <port>\n"
 "  block-port / engelle-port  <tcp|udp> <port>\n"
@@ -847,6 +1013,14 @@ int main(int argc, char **argv)
 		return cmd_ip(argv[2], 1);
 	if ((!strcmp(argv[1], "unblock-ip") || !strcmp(argv[1], "kaldir")) && argc == 3)
 		return cmd_ip(argv[2], 0);
+	if ((!strcmp(argv[1], "block-dst") || !strcmp(argv[1], "engelle-hedef")) && argc == 3)
+		return cmd_dst(argv[2], 1);
+	if ((!strcmp(argv[1], "unblock-dst") || !strcmp(argv[1], "kaldir-hedef")) && argc == 3)
+		return cmd_dst(argv[2], 0);
+	if ((!strcmp(argv[1], "block-range") || !strcmp(argv[1], "engelle-aralik")) && argc == 5)
+		return cmd_range(argv[2], argv[3], argv[4], 1);
+	if ((!strcmp(argv[1], "unblock-range") || !strcmp(argv[1], "kaldir-aralik")) && argc == 5)
+		return cmd_range(argv[2], argv[3], argv[4], 0);
 	if ((!strcmp(argv[1], "block-flow") || !strcmp(argv[1], "engelle-akis")) && argc == 5)
 		return cmd_flow(argv[2], argv[3], argv[4], 1);
 	if ((!strcmp(argv[1], "unblock-flow") || !strcmp(argv[1], "kaldir-akis")) && argc == 5)

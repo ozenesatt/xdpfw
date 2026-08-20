@@ -46,6 +46,21 @@ struct {
 	__type(value, struct rule_stat);
 } blocked_flows SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 1024);
+	__type(key, struct lpm_key);
+	__type(value, struct rule_stat);
+} blocked_dsts SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_RANGES);
+	__type(key, __u32);
+	__type(value, struct port_range);
+} port_ranges SEC(".maps");
+
 /*
  * Calisma modu ve diger ayarlar.
  * ARRAY secildi (rodata degil) cunku calisirken degistirilebilmeli.
@@ -148,6 +163,9 @@ int xdp_fw(struct xdp_md *ctx)
 	struct port_key pk;
 	struct lpm_key lk;
 	struct flow_key fk;
+	__u32 daddr;
+	__u16 dport_h;
+	int i;
 	void *l4;
 	__u32 ihl_bytes, saddr;
 	__u16 dport = 0;
@@ -214,6 +232,23 @@ int xdp_fw(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
+	/* --- KURAL 1b: hedef IP blacklist --- */
+	if (mod == MODE_BLACKLIST) {
+		daddr = ip->daddr;
+		__builtin_memset(&lk, 0, sizeof(lk));
+		lk.prefixlen = 32;
+		__builtin_memcpy(lk.data, &daddr, 4);
+
+		rs = bpf_map_lookup_elem(&blocked_dsts, &lk);
+		if (rs) {
+			__sync_fetch_and_add(&rs->hits, 1);
+			bump(STAT_DROPPED);
+			bump(STAT_DROP_DST);
+			olay_gonder(saddr, 0, ip->protocol, REASON_DST);
+			return XDP_DROP;
+		}
+	}
+
 	/* --- Protokol sayaci + hedef port --- */
 	switch (ip->protocol) {
 	case IPPROTO_TCP: {
@@ -255,6 +290,35 @@ int xdp_fw(struct xdp_md *ctx)
 			bump(STAT_DROPPED);
 			bump(STAT_DROP_FLOW);
 			olay_gonder(saddr, dport, ip->protocol, REASON_FLOW);
+			return XDP_DROP;
+		}
+	}
+
+	/* --- KURAL 2b: port araligi ---
+	 * Dizi uzerinde dongu. #pragma unroll ile derleyici donguyu
+	 * aciyor; tur sayisi derleme zamaninda sabit olmali, yoksa
+	 * verifier "her yolun sonlandigini" ispatlayamaz.
+	 */
+	if (dport && mod == MODE_BLACKLIST) {
+		dport_h = bpf_ntohs(dport);
+
+#pragma unroll
+		for (i = 0; i < MAX_RANGES; i++) {
+			__u32 k = i;
+			struct port_range *pr;
+
+			pr = bpf_map_lookup_elem(&port_ranges, &k);
+			if (!pr || pr->proto == 0)
+				continue;
+			if (pr->proto != ip->protocol)
+				continue;
+			if (dport_h < pr->bas || dport_h > pr->son)
+				continue;
+
+			__sync_fetch_and_add(&pr->hits, 1);
+			bump(STAT_DROPPED);
+			bump(STAT_DROP_RANGE);
+			olay_gonder(saddr, dport, ip->protocol, REASON_RANGE);
 			return XDP_DROP;
 		}
 	}

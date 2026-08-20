@@ -16,6 +16,8 @@ enum stat_idx {
 	STAT_DROPPED,
 	STAT_DROP_IP,     /* IP kurali dusurdu */
 	STAT_DROP_PORT,   /* port kurali dusurdu */
+	STAT_DROP_DST,    /* hedef IP kurali dusurdu */
+	STAT_DROP_RANGE,  /* port araligi dusurdu */
 	STAT_DROP_FLOW,   /* bilesik kural dusurdu */
 	STAT_DROP_WL,     /* whitelist: izinli degil */
 	STAT_MAX,
@@ -38,6 +40,8 @@ enum cfg_idx {
 enum drop_reason {
 	REASON_IP = 0,
 	REASON_PORT,
+	REASON_DST,           /* hedef IP kurali */
+	REASON_RANGE,         /* port araligi */
 	REASON_FLOW,          /* bilesik kural */
 	REASON_NOT_ALLOWED,   /* whitelist: izinli listede yok */
 };
@@ -61,6 +65,18 @@ struct rule_stat {
 	__u64 hits;
 };
 
+
+
+/* Port araligi kurali. Dizi uzerinde donguyle taranir. */
+#define MAX_RANGES 16
+
+struct port_range {
+	__u16 bas;     /* host byte order - karsilastirma icin */
+	__u16 son;
+	__u8  proto;   /* IPPROTO_TCP / IPPROTO_UDP, 0 = bos slot */
+	__u8  pad[3];
+	__u64 hits;
+};
 
 /*
  * Bilesik kural anahtari: kaynak IP + protokol + hedef port.
