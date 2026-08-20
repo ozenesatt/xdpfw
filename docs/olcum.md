@@ -99,3 +99,51 @@ Filtreleme yaklaşımları arasındaki fark %13 civarında, ancak tur içi sapma
 Bu kısıtlar nedeniyle "XDP iptables'tan N kat hızlıdır" gibi bir iddia
 bu ölçümlerle desteklenemez. Güvenilir olan bulgu, Gün 11'de aynı program
 içinde ölçülen XDP_DROP vs XDP_PASS farkıdır (%57, sapma <%2).
+
+---
+
+# Kural Sayısının Etkisi (Gün 26)
+
+Proje 26 gün boyunca 1 kural tipinden 7'ye çıktı. Her paket artık şu
+kontrollerden geçiyor: kaynak IP (LPM trie), hız sınırı (LPM trie +
+token bucket), hedef IP (LPM trie), bileşik kural (hash), port aralığı
+(16 turluk döngü), hedef port (hash).
+
+## Sonuçlar (paket/saniye)
+
+| Yapılandırma | Ölçüm 1 | Ölçüm 2 | Ortalama |
+|---|---|---|---|
+| Kural yok | 268.874 | 276.901 | 272.888 |
+| 8 kural yüklü, hiçbiri eşleşmiyor | 296.187 | 277.679 | 286.933 |
+| İlk kuralda DROP | 414.985 | — | 414.985 |
+
+## Bulgular
+
+**1. Kural sayısı pps'i etkilemedi**
+
+8 kural yüklüyken ve hiçbiri gelen trafiğe uymazken — yani her paket
+tüm kontrollerden geçip XDP_PASS alırken — ölçülen değer kuralsız
+duruma göre farklılık göstermedi (%5 fark, tur içi sapma %6).
+
+BPF map aramaları düşük maliyetli: hash O(1), LPM trie IPv4 için en
+fazla 32 adım, port aralığı döngüsü derleme zamanında açılmış 16 tur.
+
+**2. DROP avantajı korunuyor (%52)**
+
+İlk kuralda düşürülen paket 414.985 pps ile işlendi. Gün 11'deki
+ölçümle (%57) tutarlı.
+
+**3. 26 günlük kod eklemesinin toplam maliyeti ihmal edilebilir**
+
+Gün 11 (tek kural kontrolü): 289.035 pps
+Gün 26 (yedi kural kontrolü + ring buffer + top talkers): 272.888 pps
+
+Aradaki %6 fark ölçüm gürültüsü mertebesinde.
+
+## Ölçüm metodolojisi notu
+
+İlk denemede "kurallı" ölçüm "kuralsız"dan yüksek çıktı. Sebep:
+kural dosyasındaki 10.10.0.2/32 kuralı yük üretecinin kaynak adresiyle
+eşleşiyordu, yani paketler ilk kuralda düşüyordu — "kurallı PASS" değil
+"DROP" ölçülmüştü. Kurallar yük üretecinin adresine dokunmayacak
+şekilde seçilerek ölçüm tekrarlandı.
