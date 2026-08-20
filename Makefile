@@ -35,3 +35,15 @@ clean:
 
 distclean: clean
 	rm -f $(SRC)/vmlinux.h
+
+PREFIX ?= /usr/local
+
+.PHONY: install uninstall
+install: $(APP)
+	install -D -m755 $(APP) $(DESTDIR)$(PREFIX)/sbin/$(APP)
+	install -D -m644 rules.conf $(DESTDIR)/etc/xdpfw/rules.conf
+	@echo "Kuruldu. Artik her yerden: sudo xdpfw basla <arayuz>"
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/sbin/$(APP)
+	@echo "Kaldirildi. Kural dosyasi /etc/xdpfw/ altinda birakildi."
