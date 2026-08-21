@@ -43,7 +43,8 @@ static int json_stats(char *buf, size_t n)
 {
 	static const char *adlar[STAT_MAX] = {
 		"total", "tcp", "udp", "icmp", "other",
-		"passed", "dropped", "drop_ip", "drop_port", "drop_wl",
+		"passed", "dropped", "drop_ip", "drop_port",
+		"drop_rate", "drop_dst", "drop_range", "drop_flow", "drop_wl",
 	};
 	__u64 *percpu;
 	int fd, ncpu, i, yaz = 0;
@@ -248,6 +249,7 @@ static const char *sebep_adi(__u8 r)
 {
 	switch (r) {
 	case REASON_IP:          return "ip";
+	case REASON_RATE:        return "hiz";
 	case REASON_DST:         return "hedef";
 	case REASON_RANGE:       return "aralik";
 	case REASON_FLOW:        return "akis";
@@ -301,6 +303,14 @@ int serve_calistir(int port)
 	struct sockaddr_in adres = {0};
 	struct ring_buffer *rb = NULL;
 	int s, opt = 1, rb_fd = -1, rb_epoll = -1;
+
+	/*
+	 * SIGPIPE'i yok say: SSE istemcisi baglantiyi kapattiginda
+	 * o sokete write() yapmak SIGPIPE uretir ve varsayilan davranis
+	 * sureci oldurmektir. Yok sayinca write() -EPIPE doner ve
+	 * istemciyi listeden cikarabiliriz.
+	 */
+	signal(SIGPIPE, SIG_IGN);
 
 	s = socket(AF_INET, SOCK_STREAM, 0);
 	if (s < 0) {
