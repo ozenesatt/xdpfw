@@ -1180,7 +1180,8 @@ static int cmd_list(void)
 
 	bos = 1;
 	printf("\nEngellenen portlar:\n");
-	{
+	fd = open_pinned("blocked_ports");
+	if (fd >= 0) {
 		struct port_key key, next_key, *pk = NULL;
 
 		while (bpf_map_get_next_key(fd, pk, &next_key) == 0) {
@@ -1194,10 +1195,10 @@ static int cmd_list(void)
 			}
 			pk = &key;
 		}
+		close(fd);
 	}
 	if (bos)
 		printf("  (yok)\n");
-	close(fd);
 
 	return 0;
 }
